@@ -1,6 +1,8 @@
 package backup
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
@@ -12,15 +14,25 @@ import (
 	"github.com/ajctrl/mariadb-backup-s3/internal/storage"
 )
 
-const timestampLayout = "2006-01-02T15:04:05"
+const timestampLayout = "2006-01-02T15:04:05.000000000Z"
+const defaultBackupTimeout = time.Hour
 
-var timestampPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$`)
-var backupSuffixPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.sql(\.gpg)?$`)
+var backupIDPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z-[0-9a-f]{32}$`)
+
+func validBackupID(id string) bool {
+	if !backupIDPattern.MatchString(id) {
+		return false
+	}
+	_, err := time.Parse(timestampLayout, id[:len(timestampLayout)])
+	return err == nil
+}
 
 type Config struct {
 	Database, Databases, BackupAll, Exclude, BackupMode  string
 	Host, Port, User, Password, DumpOptions, SSLCA       string
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule string
+	RestoreDatabaseDefaults                              string
+	BackupTimeout                                        time.Duration
 	Storage                                              storage.Config
 }
 
@@ -41,7 +53,8 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 		prefix = "backup"
 	}
 	c := Config{
-		Database: get("MARIADB_DATABASE"), Databases: get("MARIADB_DATABASES"),
+		RestoreDatabaseDefaults: get("RESTORE_DATABASE_DEFAULTS"),
+		Database:                get("MARIADB_DATABASE"), Databases: get("MARIADB_DATABASES"),
 		BackupAll: valueOr("MARIADB_BACKUP_ALL", "false"), Exclude: get("MARIADB_DATABASES_EXCLUDE"),
 		BackupMode: valueOr("BACKUP_MODE", "per-database"), SSLCA: get("MARIADB_SSL_CA"),
 		Host: get("MARIADB_HOST"), Port: valueOr("MARIADB_PORT", "3306"),
@@ -73,15 +86,22 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	if c.FilenameMode != "timestamp" && c.FilenameMode != "fixed" {
 		return c, fmt.Errorf("BACKUP_FILENAME_MODE must be timestamp or fixed.")
 	}
-	partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", "8"), 10, 64)
+	partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", strconv.FormatInt(storage.DefaultUploadPartSizeBytes/(1024*1024), 10)), 10, 64)
 	if err != nil || partSize < 5 || partSize > 5120 {
 		return c, fmt.Errorf("S3_UPLOAD_PART_SIZE_MB must be an integer between 5 and 5120 (MiB).")
 	}
 	c.Storage.UploadPartSizeBytes = partSize * 1024 * 1024
+	c.BackupTimeout, err = time.ParseDuration(valueOr("BACKUP_TIMEOUT", defaultBackupTimeout.String()))
+	if err != nil || c.BackupTimeout <= 0 {
+		return c, fmt.Errorf("BACKUP_TIMEOUT must be a positive duration, such as 30m or 6h.")
+	}
 	return c, nil
 }
 
 func (c Config) validateBackup() (int, error) {
+	if c.BackupTimeout < 0 {
+		return 0, fmt.Errorf("BACKUP_TIMEOUT must be a positive duration.")
+	}
 	if c.BackupMode != "" && c.BackupMode != "per-database" && c.BackupMode != "combined" {
 		return 0, fmt.Errorf("BACKUP_MODE must be per-database or combined.")
 	}
@@ -214,14 +234,29 @@ func (c Config) fixedKey(database string) string {
 	return c.keyPrefix() + name + c.fileType()
 }
 
-func (c Config) backupKey(database string, now time.Time) string {
+func (c Config) backupKey(database string, now time.Time) (string, error) {
 	if c.FilenameMode == "fixed" {
-		return c.fixedKey(database)
+		return c.fixedKey(database), nil
 	}
-	return c.timestampPrefix(database) + now.UTC().Format(timestampLayout) + c.fileType()
+	// Clock precision alone cannot prevent collisions across processes or when
+	// the wall clock repeats. Give each object an independent 128-bit identity.
+	var randomID [16]byte
+	if _, err := rand.Read(randomID[:]); err != nil {
+		return "", fmt.Errorf("generate backup ID: %w", err)
+	}
+	id := now.UTC().Format(timestampLayout) + "-" + hex.EncodeToString(randomID[:])
+	return c.timestampPrefix(database) + id + c.fileType(), nil
 }
 
 func (c Config) isTimestampBackup(database, key string) bool {
 	prefix := c.timestampPrefix(database)
-	return strings.HasPrefix(key, prefix) && backupSuffixPattern.MatchString(strings.TrimPrefix(key, prefix))
+	if !strings.HasPrefix(key, prefix) {
+		return false
+	}
+	name := strings.TrimPrefix(key, prefix)
+	name = strings.TrimSuffix(name, ".gpg")
+	if !strings.HasSuffix(name, ".sql") {
+		return false
+	}
+	return validBackupID(strings.TrimSuffix(name, ".sql"))
 }

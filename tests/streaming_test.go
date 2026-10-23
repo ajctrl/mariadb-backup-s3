@@ -134,3 +134,27 @@ func TestStreamingFailuresStopOtherProcessesAndReleaseLock(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamingTimeoutAbortsMultipartUpload(t *testing.T) {
+	f := streamingFixture(t, true)
+	f.env["BACKUP_TIMEOUT"] = "1s"
+	p := f.background("backup")
+	waitForFile(t, f.env["STREAM_ENTERED"], p)
+	if err := p.wait(t); err == nil {
+		t.Fatal("stalled multipart upload returned success")
+	}
+	output, _ := os.ReadFile(p.output)
+	if !strings.Contains(string(output), "backup exceeded BACKUP_TIMEOUT=1s") {
+		t.Fatalf("missing timeout diagnostic: %s", output)
+	}
+	assertEqual(t, completedUploads(f), 0)
+	aborts := f.s3.calls("DELETE")
+	if len(aborts) != 1 || !aborts[0].Query.Has("uploadId") {
+		t.Fatalf("multipart upload was not aborted: %v", aborts)
+	}
+	assertEqual(t, len(f.s3.calls("list")), 0)
+	f.assertClean()
+	next := newFixture(t)
+	next.env["MARIADB_DATABASE"] = "app"
+	next.run(true, "backup")
+}

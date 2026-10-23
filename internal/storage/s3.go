@@ -26,7 +26,7 @@ type Object struct {
 
 type Store interface {
 	VersioningEnabled(context.Context) (bool, error)
-	Upload(ctx context.Context, key string, body io.ReadCloser) error
+	Upload(ctx context.Context, key string, body io.ReadCloser, options UploadOptions) error
 	Download(ctx context.Context, key, versionID, path string) error
 	List(ctx context.Context, prefix string) ([]Object, error)
 	Delete(ctx context.Context, key string) error
@@ -42,11 +42,17 @@ type Config struct {
 	UploadPartSizeBytes int64
 }
 
+const (
+	DefaultUploadPartSizeBytes int64 = 8 * 1024 * 1024
+	MaxUploadParts             int64 = 10000
+)
+
 type S3 struct {
 	bucket         string
 	client         *s3.Client
 	transfer       *transfermanager.Client
 	uploadPartSize int64
+	maxUploadParts int64
 }
 
 var _ Store = (*S3)(nil)
@@ -66,7 +72,7 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 		return nil, fmt.Errorf("S3 bucket must not be empty")
 	}
 	if cfg.UploadPartSizeBytes == 0 {
-		cfg.UploadPartSizeBytes = 8 * 1024 * 1024
+		cfg.UploadPartSizeBytes = DefaultUploadPartSizeBytes
 	}
 	if cfg.UploadPartSizeBytes < 5*1024*1024 || cfg.UploadPartSizeBytes > 5*1024*1024*1024 {
 		return nil, fmt.Errorf("S3 upload part size must be between 5 MiB and 5 GiB")
@@ -117,7 +123,10 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 		// Respect AWS_REQUEST_CHECKSUM_CALCULATION and profile configuration.
 		o.RequestChecksumCalculation = awsConfig.RequestChecksumCalculation
 	})
-	return &S3{bucket: cfg.Bucket, client: client, transfer: transfer, uploadPartSize: cfg.UploadPartSizeBytes}, nil
+	return &S3{
+		bucket: cfg.Bucket, client: client, transfer: transfer,
+		uploadPartSize: cfg.UploadPartSizeBytes, maxUploadParts: MaxUploadParts,
+	}, nil
 }
 
 func (s *S3) VersioningEnabled(ctx context.Context) (bool, error) {

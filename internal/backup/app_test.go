@@ -19,8 +19,10 @@ type recordingStore struct {
 	listErr error
 }
 
-func (s *recordingStore) VersioningEnabled(context.Context) (bool, error)        { return true, nil }
-func (s *recordingStore) Upload(context.Context, string, io.ReadCloser) error    { return nil }
+func (s *recordingStore) VersioningEnabled(context.Context) (bool, error) { return true, nil }
+func (s *recordingStore) Upload(context.Context, string, io.ReadCloser, storage.UploadOptions) error {
+	return nil
+}
 func (s *recordingStore) Download(context.Context, string, string, string) error { return nil }
 func (s *recordingStore) List(_ context.Context, prefix string) ([]storage.Object, error) {
 	s.prefix = prefix
@@ -34,25 +36,26 @@ func (s *recordingStore) Delete(_ context.Context, key string) error {
 func TestRetentionBoundaryAndExactMatching(t *testing.T) {
 	cutoff := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	expired := []storage.Object{
-		{Key: "backup/app/2026-09-05T11:59:59.sql", LastModified: cutoff.Add(-time.Second)},
-		{Key: "backup/app/2026-09-05T11:59:59.sql.gpg", LastModified: cutoff.Add(-time.Nanosecond)},
+		{Key: "backup/app/2026-09-05T11:59:59.000000000Z-00000000000000000000000000000000.sql", LastModified: cutoff.Add(-time.Second)},
+		{Key: "backup/app/2026-09-05T11:59:59.000000000Z-00000000000000000000000000000000.sql.gpg", LastModified: cutoff.Add(-time.Nanosecond)},
 	}
 	objects := append([]storage.Object{}, expired...)
 	objects = append(objects,
-		storage.Object{Key: "backup/app/2026-09-05T12:00:00.sql", LastModified: cutoff},
-		storage.Object{Key: "backup/app/2026-09-05T12:00:01.sql.gpg", LastModified: cutoff.Add(time.Nanosecond)},
+		storage.Object{Key: "backup/app/2026-09-05T12:00:00.000000000Z-00000000000000000000000000000000.sql", LastModified: cutoff},
+		storage.Object{Key: "backup/app/2026-09-05T12:00:01.000000000Z-00000000000000000000000000000000.sql.gpg", LastModified: cutoff.Add(time.Nanosecond)},
 	)
 	for _, key := range []string{
-		"backup/app_latest.sql", "backup/app_latest.sql.gpg", "backup/app/extra_2000-01-01T00:00:00.sql",
-		"backup/app/2000-01-01T00%3A00%3A00/latest.sql", "backup/other_2000-01-01T00:00:00.sql",
-		"backup/app/notes.sql", "backup/app/2000-01-01T00:00:00.sql.extra", "backup/app/2000-01-01T00:00:00.sql\n",
+		"backup/app/2000-01-01T00:00:00.sql", "backup/app/2000-01-01T00:00:00.sql.gpg",
+		"backup/app_latest.sql", "backup/app_latest.sql.gpg", "backup/app/extra_2000-01-01T00:00:00.000000000Z-00000000000000000000000000000000.sql",
+		"backup/app/2000-01-01T00%3A00%3A00/latest.sql", "backup/other_2000-01-01T00:00:00.000000000Z-00000000000000000000000000000000.sql",
+		"backup/app/notes.sql", "backup/app/2000-01-01T00:00:00.000000000Z-00000000000000000000000000000000.sql.extra", "backup/app/2000-01-01T00:00:00.000000000Z-00000000000000000000000000000000.sql\n",
 	} {
 		objects = append(objects, storage.Object{Key: key, LastModified: cutoff.Add(-time.Hour)})
 	}
 	for _, mode := range []string{"timestamp", "fixed"} {
 		s := &recordingStore{objects: objects}
 		a := New(Config{Prefix: "backup", FilenameMode: mode}, s, io.Discard, io.Discard)
-		if err := a.removeOldBackups(context.Background(), "app", cutoff); err != nil {
+		if err := a.removeOldBackups(context.Background(), "app", cutoff, nil); err != nil {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(s.deleted, []string{expired[0].Key, expired[1].Key}) || s.prefix != "backup/app/" {
@@ -63,11 +66,11 @@ func TestRetentionBoundaryAndExactMatching(t *testing.T) {
 
 func TestRetentionNeverDeletesAfterIncompleteListing(t *testing.T) {
 	for _, s := range []*recordingStore{
-		{objects: []storage.Object{{Key: "backup/app/2000-01-01T00:00:00.sql"}}},
+		{objects: []storage.Object{{Key: "backup/app/2000-01-01T00:00:00.000000000Z-00000000000000000000000000000000.sql"}}},
 		{listErr: errors.New("second page failed")},
 	} {
 		a := New(Config{Prefix: "backup"}, s, io.Discard, io.Discard)
-		if err := a.removeOldBackups(context.Background(), "app", time.Now()); err == nil || len(s.deleted) != 0 {
+		if err := a.removeOldBackups(context.Background(), "app", time.Now(), nil); err == nil || len(s.deleted) != 0 {
 			t.Errorf("unsafe incomplete listing: err=%v deleted=%v", err, s.deleted)
 		}
 	}

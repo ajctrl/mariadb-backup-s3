@@ -18,7 +18,7 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 		})
 	}
 	c, err := load(nil)
-	if err != nil || c.Prefix != "backup" || c.Port != "3306" || c.BackupMode != "per-database" || c.FilenameMode != "timestamp" || c.Storage.Region != "us-west-1" {
+	if err != nil || c.Prefix != "backup" || c.Port != "3306" || c.BackupMode != "per-database" || c.FilenameMode != "timestamp" || c.Storage.Region != "us-west-1" || c.BackupTimeout != time.Hour {
 		t.Fatalf("default configuration: %#v, %v", c, err)
 	}
 	c, err = load(map[string]string{"S3_PREFIX": "", "MARIADB_PORT": "3307", "BACKUP_MODE": "combined"})
@@ -39,6 +39,17 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	for _, port := range []string{"0", "65536", "-1", "abc"} {
 		if _, err := load(map[string]string{"MARIADB_PORT": port}); err == nil {
 			t.Errorf("accepted invalid port %q", port)
+		}
+	}
+	for value, want := range map[string]time.Duration{"": time.Hour, "30m": 30 * time.Minute, "6h": 6 * time.Hour, "500ms": 500 * time.Millisecond} {
+		c, err := load(map[string]string{"BACKUP_TIMEOUT": value})
+		if err != nil || c.BackupTimeout != want {
+			t.Errorf("timeout %q: %s, %v", value, c.BackupTimeout, err)
+		}
+	}
+	for _, value := range []string{"0", "0s", "-1h", "forever", "60", "999999999999h"} {
+		if _, err := load(map[string]string{"BACKUP_TIMEOUT": value}); err == nil || !strings.Contains(err.Error(), "BACKUP_TIMEOUT") {
+			t.Errorf("invalid timeout %q: %v", value, err)
 		}
 	}
 }
@@ -84,22 +95,22 @@ func TestNamesAndKeysSeparateBackupModes(t *testing.T) {
 	} {
 		c := Config{Prefix: tc.prefix, FilenameMode: "timestamp"}
 		date := time.Date(2026, 9, 12, 12, 30, 0, 0, time.FixedZone("plus2", 2*3600))
-		if got := c.backupKey("app", date); got != tc.timestampPrefix+"app/2026-09-12T10:30:00.sql" {
-			t.Errorf("timestamp prefix %q: %q", tc.prefix, got)
+		if got, err := c.backupKey("app", date); err != nil || !strings.HasPrefix(got, tc.timestampPrefix+"app/2026-09-12T10:30:00.000000000Z-") || !c.isTimestampBackup("app", got) {
+			t.Errorf("timestamp prefix %q: %q, %v", tc.prefix, got, err)
 		}
 		c.FilenameMode, c.Passphrase = "fixed", "secret"
 		for name, directory := range map[string]string{"app": "app", "a/b": "a%2Fb", ".": ".", "..": ".."} {
-			if got := c.backupKey(name, date); got != tc.fixedPrefix+directory+"_latest.sql.gpg" {
-				t.Errorf("fixed key %q/%q: %q", tc.prefix, name, got)
+			if got, err := c.backupKey(name, date); err != nil || got != tc.fixedPrefix+directory+"_latest.sql.gpg" {
+				t.Errorf("fixed key %q/%q: %q, %v", tc.prefix, name, got, err)
 			}
 		}
 		c.BackupMode = "combined"
-		if got := c.backupKey("app", date); got != tc.fixedPrefix+"latest.sql.gpg" {
-			t.Errorf("combined fixed key: %q", got)
+		if got, err := c.backupKey("app", date); err != nil || got != tc.fixedPrefix+"latest.sql.gpg" {
+			t.Errorf("combined fixed key: %q, %v", got, err)
 		}
 		c.FilenameMode = "timestamp"
-		if got := c.backupKey("app", date); got != tc.timestampPrefix+"2026-09-12T10:30:00.sql.gpg" {
-			t.Errorf("combined timestamp key: %q", got)
+		if got, err := c.backupKey("app", date); err != nil || !strings.HasPrefix(got, tc.timestampPrefix+"2026-09-12T10:30:00.000000000Z-") || !strings.HasSuffix(got, ".sql.gpg") || !c.isTimestampBackup("app", got) {
+			t.Errorf("combined timestamp key: %q, %v", got, err)
 		}
 	}
 	for _, names := range [][]string{nil, {""}, {"app", ""}, {"a\nb"}, {"a\x00b"}, {"a\x7fb"}, {string([]byte{0xff})}} {
@@ -109,8 +120,48 @@ func TestNamesAndKeysSeparateBackupModes(t *testing.T) {
 	}
 }
 
+func TestBackupKeysRemainDistinctWithIdenticalClocks(t *testing.T) {
+	date := time.Date(2026, 10, 22, 12, 0, 0, 123456789, time.UTC)
+	for _, mode := range []string{"per-database", "combined"} {
+		c := Config{Prefix: "backup", FilenameMode: "timestamp", BackupMode: mode}
+		seen := make(map[string]bool)
+		for range 1000 {
+			key, err := c.backupKey("app", date)
+			if err != nil || seen[key] || !c.isTimestampBackup("app", key) {
+				t.Fatalf("invalid or repeated key: %q, %v", key, err)
+			}
+			seen[key] = true
+		}
+		later, err := c.backupKey("app", date.Add(time.Nanosecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for key := range seen {
+			if later <= key {
+				t.Fatalf("keys do not preserve timestamp order: %q <= %q", later, key)
+			}
+		}
+	}
+}
+
+func TestBackupIDRejectsLegacyAndMalformedNames(t *testing.T) {
+	valid := "2026-10-22T12:00:00.123456789Z-0123456789abcdef0123456789abcdef"
+	if !validBackupID(valid) {
+		t.Fatal("valid ID rejected")
+	}
+	for _, id := range []string{
+		"2026-10-22T12:00:00", strings.Replace(valid, "10-22", "02-30", 1),
+		strings.Replace(valid, ".123456789", ".123456", 1), valid + "\n", valid + ".sql",
+		strings.ToUpper(valid), "../" + valid, valid[:len(valid)-1],
+	} {
+		if validBackupID(id) {
+			t.Errorf("invalid ID accepted: %q", id)
+		}
+	}
+}
+
 func TestDumpOptionsPreserveOutputAndSelection(t *testing.T) {
-	for _, value := range []string{"--force", "--help", "--result-file=/tmp/out", "--res=/tmp/out", "--xml", "--tab=/tmp/out", "--databases", "--all-databases", "--host=elsewhere", "--password=secret", "app", "--", "--ignore-table="} {
+	for _, value := range []string{"--force", "--help", "--result-file=/tmp/out", "--res=/tmp/out", "--xml", "--tab=/tmp/out", "--databases", "--all-databases", "--host=elsewhere", "--password=secret", "app", "--", "--ignore-table=", "--skip-dump-history", "--dump-history=0"} {
 		c := Config{Database: "app", BackupAll: "false", DumpOptions: value}
 		if _, err := c.validateBackup(); err == nil {
 			t.Errorf("accepted unsafe option %q", value)

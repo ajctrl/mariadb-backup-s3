@@ -113,7 +113,18 @@ func (a *App) Backup(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
-	return a.withRunner(lock, func(runner commandRunner) error { return a.backup(ctx, runner) })
+	timeout := a.Config.BackupTimeout
+	if timeout == 0 {
+		timeout = defaultBackupTimeout
+	}
+	ctx, cancel := context.WithTimeoutCause(ctx, timeout,
+		fmt.Errorf("backup exceeded BACKUP_TIMEOUT=%s: %w", timeout, context.DeadlineExceeded))
+	defer cancel()
+	err = a.withRunner(lock, func(runner commandRunner) error { return a.backup(ctx, runner) })
+	if ctx.Err() != nil {
+		return errors.Join(context.Cause(ctx), err)
+	}
+	return err
 }
 
 func (a *App) backup(ctx context.Context, runner commandRunner) error {
@@ -121,22 +132,33 @@ func (a *App) backup(ctx context.Context, runner commandRunner) error {
 	if err != nil {
 		return err
 	}
+	partSize := a.Config.Storage.UploadPartSizeBytes
+	if partSize == 0 {
+		partSize = storage.DefaultUploadPartSizeBytes
+	}
+	limit := partSize * storage.MaxUploadParts
+	fmt.Fprintf(a.Out, "S3 upload: S3_UPLOAD_PART_SIZE_MB=%d MiB; per-object stream limit=%d bytes (%.3f GiB, %d parts), measured after encryption when enabled.\n",
+		partSize/(1024*1024), limit, float64(limit)/(1024*1024*1024), storage.MaxUploadParts)
 	// The shell implementation captured epoch seconds at run start. Preserve
 	// that boundary so objects at the cutoff second are still retained.
-	cutoff := a.now().UTC().Truncate(time.Second).Add(-time.Duration(days) * 24 * time.Hour)
+	clock := &backupClock{now: a.now, latest: a.now().UTC()}
+	cutoff := clock.latest.Truncate(time.Second).Add(-time.Duration(days) * 24 * time.Hour)
 	if a.Config.FilenameMode == "fixed" {
 		enabled, err := a.Store.VersioningEnabled(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			fmt.Fprintf(a.Err, "Warning: Could not verify S3 bucket versioning: %v. Continuing with fixed filenames; if versioning is disabled, uploading will overwrite the previous backup without preserving it.\n", err)
+			return fmt.Errorf("cannot verify S3 bucket versioning; fixed-name backup requires a successful Enabled check (s3:GetBucketVersioning permission is required): %w", err)
 		} else if !enabled {
 			return fmt.Errorf("Fixed filenames require S3 bucket versioning to be Enabled.")
 		}
 	}
 	databases, err := a.databases(ctx, runner)
 	if err != nil {
+		return err
+	}
+	if err := a.checkHistorySupport(ctx, runner, databases); err != nil {
 		return err
 	}
 	groups := make([][]string, len(databases))
@@ -153,18 +175,27 @@ func (a *App) backup(ctx context.Context, runner commandRunner) error {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := a.backupDatabases(ctx, runner, group); err != nil {
+		if err := a.backupDatabases(ctx, runner, group, clock); err != nil {
 			fmt.Fprintf(a.Err, "Backup failed: %s: %v\n", label, err)
 			failed++
+			if errors.Is(err, errClockRollback) {
+				return err
+			}
 		} else {
 			succeeded++
 			if days > 0 {
-				if err := a.removeOldBackups(ctx, database, cutoff); err != nil {
+				if err := a.removeOldBackups(ctx, database, cutoff, clock.check); err != nil {
 					fmt.Fprintf(a.Err, "Retention cleanup failed: %s: %v\n", label, err)
 					cleanupFailed++
+					if errors.Is(err, errClockRollback) {
+						return err
+					}
 				}
 			}
 		}
+	}
+	if err := clock.check(); err != nil {
+		return err
 	}
 	fmt.Fprintf(a.Out, "Backup summary: %d succeeded, %d failed, %d retention cleanups failed.\n", succeeded, failed, cleanupFailed)
 	if err := ctx.Err(); err != nil {
@@ -190,7 +221,7 @@ func (a *App) databases(ctx context.Context, runner commandRunner) ([]string, er
 	if c.BackupAll == "true" {
 		fmt.Fprintln(a.Out, "Discovering databases...")
 		args := append(a.connectionArgs(), "--batch", "--raw", "--skip-column-names",
-			"--execute=SELECT HEX(SCHEMA_NAME) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') ORDER BY SCHEMA_NAME;")
+			"--execute=SELECT HEX(SCHEMA_NAME) FROM information_schema.SCHEMATA WHERE BINARY IF(@@lower_case_table_names = 0, SCHEMA_NAME, LOWER(SCHEMA_NAME)) NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') ORDER BY SCHEMA_NAME;")
 		var output bytes.Buffer
 		if err := runner.run(ctx, &output, "mariadb", args...); err != nil {
 			return nil, fmt.Errorf("Could not discover databases: %w", err)
@@ -236,16 +267,23 @@ func (a *App) databases(ctx context.Context, runner commandRunner) ([]string, er
 	return selected, nil
 }
 
-func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databases []string) error {
+func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databases []string, clock *backupClock) error {
 	database := databases[0]
-	key := a.Config.backupKey(database, a.now())
+	started, err := clock.read()
+	if err != nil {
+		return err
+	}
+	key, err := a.Config.backupKey(database, started)
+	if err != nil {
+		return err
+	}
 	label := strings.Join(databases, ", ")
 	fmt.Fprintf(a.Out, "Creating backup of databases: %s...\n", label)
 	opts, err := a.Config.dumpOptions()
 	if err != nil {
 		return err
 	}
-	args := append(a.connectionArgs(), "--quick", "--routines", "--events", "--triggers", "--hex-blob")
+	args := append(a.connectionArgs(), "--quick", "--routines", "--events", "--triggers", "--hex-blob", "--dump-history")
 	locked := false
 	for _, opt := range opts {
 		locked = locked || opt == "--lock-all-tables"
@@ -254,9 +292,7 @@ func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databas
 		args = append(args, "--single-transaction")
 	}
 	args = append(args, opts...)
-	if a.Config.BackupMode == "combined" {
-		args = append(args, "--databases")
-	}
+	args = append(args, "--databases")
 	args = append(args, "--")
 	args = append(args, databases...)
 	commands := []pipelineCommand{{name: "mariadb-dump", args: args}}
@@ -279,14 +315,22 @@ func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databas
 		writer.CloseWithError(err)
 		done <- err
 	}()
-	fmt.Fprintf(a.Out, "Uploading backup of %s...\n", label)
-	uploadErr := a.Store.Upload(ctx, key, reader)
+	fmt.Fprintf(a.Out, "Uploading backup of %s to S3 key %s...\n", label, key)
+	uploadErr := a.Store.Upload(ctx, key, reader, storage.UploadOptions{
+		RequireAbsent: a.Config.FilenameMode != "fixed",
+		BeforePublish: clock.check,
+	})
 	// An upload failure must stop both mariadb-dump and GPG and release backpressure.
 	if uploadErr != nil {
 		cancel()
 		reader.CloseWithError(uploadErr)
 	}
 	if err := errors.Join(uploadErr, <-done); err != nil {
+		return err
+	}
+	// A rollback during the S3 request cannot undo an already published object,
+	// but it must still stop retention and subsequent database backups.
+	if err := clock.check(); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.Out, "Backup complete: %s\n", label)
@@ -307,7 +351,7 @@ func (a *App) timestampBackups(ctx context.Context, database string) ([]storage.
 	return backups, nil
 }
 
-func (a *App) removeOldBackups(ctx context.Context, database string, cutoff time.Time) error {
+func (a *App) removeOldBackups(ctx context.Context, database string, cutoff time.Time, beforeDelete func() error) error {
 	objects, err := a.timestampBackups(ctx, database)
 	if err != nil {
 		return err
@@ -323,6 +367,11 @@ func (a *App) removeOldBackups(ctx context.Context, database string, cutoff time
 			return err
 		}
 		if object.LastModified.Before(cutoff) {
+			if beforeDelete != nil {
+				if err := beforeDelete(); err != nil {
+					return err
+				}
+			}
 			if err := a.Store.Delete(ctx, object.Key); err != nil {
 				return err
 			}
@@ -347,24 +396,24 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	timestamp, versionID := "", ""
+	backupID, versionID := "", ""
 	switch len(args) {
 	case 0:
 	case 1:
 		if c.FilenameMode != "timestamp" {
 			return fmt.Errorf("Use --version-id ID to restore a previous fixed-name backup.")
 		}
-		if !timestampPattern.MatchString(args[0]) {
-			return fmt.Errorf("Invalid backup timestamp.")
+		if !validBackupID(args[0]) {
+			return fmt.Errorf("Invalid backup ID; expected UTC timestamp with 9 fractional digits and a 32-character lowercase hexadecimal ID.")
 		}
-		timestamp = args[0]
+		backupID = args[0]
 	case 2:
 		if args[0] != "--version-id" || args[1] == "" || c.FilenameMode != "fixed" {
 			return fmt.Errorf("--version-id ID requires BACKUP_FILENAME_MODE=fixed.")
 		}
 		versionID = args[1]
 	default:
-		return fmt.Errorf("Usage: restore.sh [timestamp | --version-id ID]")
+		return fmt.Errorf("Usage: restore.sh [backup-id | --version-id ID]")
 	}
 	return a.withRunner(nil, func(runner commandRunner) error {
 		return withWorkspace(func(dir string) error {
@@ -372,8 +421,8 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 			switch {
 			case c.FilenameMode == "fixed":
 				key = c.fixedKey(c.Database)
-			case timestamp != "":
-				key = c.timestampPrefix(c.Database) + timestamp + c.fileType()
+			case backupID != "":
+				key = c.timestampPrefix(c.Database) + backupID + c.fileType()
 			default:
 				fmt.Fprintf(a.Out, "Finding latest backup of %s...\n", label)
 				objects, err := a.timestampBackups(ctx, c.Database)
@@ -405,17 +454,22 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 					return err
 				}
 			}
-			fmt.Fprintf(a.Out, "Restoring %s from backup...\n", label)
 			file, err := os.Open(filepath.Join(dir, "db.sql"))
 			if err != nil {
 				return err
 			}
 			defer file.Close()
-			args := append(a.connectionArgs(), "--batch", "--binary-mode")
-			if c.BackupMode != "combined" {
-				args = append(args, "--database="+c.Database)
+			input, err := newRestoreInput(file)
+			if err != nil {
+				return err
 			}
-			if err := runner.runInput(ctx, file, a.Out, "mariadb", args...); err != nil {
+			defer input.Close()
+			if err := a.prepareRestore(ctx, runner, input); err != nil {
+				return err
+			}
+			fmt.Fprintf(a.Out, "Restoring %s from backup...\n", label)
+			args := append(a.connectionArgs(), "--batch", "--binary-mode", "--skip-print-query-on-error", "--max-allowed-packet=1073741824")
+			if err := runner.runInput(ctx, input, a.Out, "mariadb", args...); err != nil {
 				return err
 			}
 			fmt.Fprintln(a.Out, "Restore complete.")
