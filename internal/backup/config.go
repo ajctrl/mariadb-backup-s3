@@ -21,15 +21,17 @@ type Config struct {
 	Database, Databases, BackupAll, Exclude, BackupMode  string
 	Host, Port, User, Password, DumpOptions, SSLCA       string
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule string
+	Timeout                                              time.Duration
 	AllowUnversionedOverwrite                            bool
+	RestoreLogErrorDetails                               bool
 	Storage                                              storage.Config
 }
 
-func LoadConfig() (Config, error) {
-	return loadConfig(os.LookupEnv)
+func LoadConfig(command string) (Config, error) {
+	return loadConfig(os.LookupEnv, command)
 }
 
-func loadConfig(lookup func(string) (string, bool)) (Config, error) {
+func loadConfig(lookup func(string) (string, bool), command string) (Config, error) {
 	get := func(key string) string { value, _ := lookup(key); return value }
 	valueOr := func(key, fallback string) string {
 		if value := get(key); value != "" {
@@ -74,11 +76,40 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	if c.FilenameMode != "timestamp" && c.FilenameMode != "fixed" {
 		return c, fmt.Errorf("BACKUP_FILENAME_MODE must be timestamp or fixed.")
 	}
+	switch valueOr("S3_ALLOW_HTTP", "false") {
+	case "false":
+	case "true":
+		c.Storage.AllowHTTP = true
+	default:
+		return c, fmt.Errorf("S3_ALLOW_HTTP must be true or false")
+	}
+	if command == "restore" {
+		switch valueOr("RESTORE_LOG_ERROR_DETAILS", "false") {
+		case "true":
+			c.RestoreLogErrorDetails = true
+		case "false":
+		default:
+			return c, fmt.Errorf("RESTORE_LOG_ERROR_DETAILS must be true or false")
+		}
+		return c, nil
+	}
 	if value, set := lookup("BACKUP_ALLOW_UNVERSIONED_OVERWRITE"); set {
 		if value != "true" && value != "false" {
 			return c, fmt.Errorf("BACKUP_ALLOW_UNVERSIONED_OVERWRITE must be true or false.")
 		}
 		c.AllowUnversionedOverwrite = value == "true"
+	}
+	timeout, err := time.ParseDuration(valueOr("BACKUP_TIMEOUT", "24h"))
+	if err != nil || timeout <= 0 {
+		return c, fmt.Errorf("BACKUP_TIMEOUT must be a positive duration")
+	}
+	c.Timeout = timeout
+	switch valueOr("S3_UPLOAD_BUFFER", "memory") {
+	case "memory":
+	case "disk":
+		c.Storage.DiskUpload = true
+	default:
+		return c, fmt.Errorf("S3_UPLOAD_BUFFER must be memory or disk")
 	}
 	partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", "8"), 10, 64)
 	if err != nil || partSize < 5 || partSize > 5120 {
@@ -144,6 +175,10 @@ func (c Config) dumpOptions() ([]string, error) {
 			"--order-by-primary", "--lock-all-tables", "--skip-single-transaction",
 			"--skip-no-autocommit", "--no-autocommit":
 			if !hasValue {
+				continue
+			}
+		case "--no-data-med":
+			if hasValue && value == "0" {
 				continue
 			}
 		case "--ignore-table", "--ignore-table-data", "--max-allowed-packet", "--net-buffer-length":

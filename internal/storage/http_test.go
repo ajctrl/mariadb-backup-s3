@@ -24,7 +24,7 @@ func timeoutS3(t *testing.T, timeout time.Duration, handler http.HandlerFunc) *S
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	s, err := newS3(t.Context(), Config{
-		Bucket: "test", Region: "us-west-1", Endpoint: server.URL,
+		Bucket: "test", Region: "us-west-1", AllowHTTP: true, Endpoint: server.URL,
 		AccessKeyID: "test-key", SecretAccessKey: "test-secret",
 	}, timeout)
 	if err != nil {
@@ -80,7 +80,8 @@ func TestS3StalledDownloadTimesOutWithoutReplacingDestination(t *testing.T) {
 	// The transfer manager includes the part-read error as text rather than
 	// preserving its net.Error type. Verify this is the socket timeout, not
 	// cancellation by the test's outer deadline.
-	if err := s.Download(ctx, "key", "", path); err == nil || !strings.Contains(err.Error(), "i/o timeout") || ctx.Err() != nil {
+	t.Setenv("TMPDIR", dir)
+	if f, err := s.Download(ctx, "key", ""); f != nil || err == nil || !strings.Contains(err.Error(), "i/o timeout") || ctx.Err() != nil {
 		t.Fatalf("stalled download: err=%v context=%v", err, ctx.Err())
 	}
 	contents, err := os.ReadFile(path)
@@ -109,12 +110,13 @@ func TestS3ProgressingDownloadOutlastsIdleTimeout(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
-	path := filepath.Join(t.TempDir(), "db.dump")
 	start := time.Now()
-	if err := s.Download(ctx, "key", "", path); err != nil {
+	file, err := s.Download(ctx, "key", "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	contents, err := os.ReadFile(path)
+	defer file.Close()
+	contents, err := io.ReadAll(file)
 	if err != nil || string(contents) != strings.Repeat("x", count) || time.Since(start) < time.Second {
 		t.Fatalf("progressing download: bytes=%d duration=%v err=%v", len(contents), time.Since(start), err)
 	}
@@ -157,7 +159,7 @@ func TestHTTPProgressingUploadOutlastsIdleTimeout(t *testing.T) {
 	base := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
 		tr.TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
 	})
-	client := withIdleTimeout(base, time.Second)
+	client := withIdleTimeout(base, time.Second, false)
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, server.URL, &pacedBody{ctx: ctx, remaining: 20 * 1024})
@@ -204,10 +206,39 @@ func TestS3StalledMultipartUploadIsAborted(t *testing.T) {
 	f.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if err := s.Upload(ctx, "large.dump", openUpload(t, path)); err == nil || ctx.Err() != nil {
+	if err := s.Upload(ctx, "large.dump", openUpload(t, path), false); err == nil || ctx.Err() != nil {
 		t.Fatalf("stalled multipart upload: err=%v context=%v", err, ctx.Err())
 	}
 	if !aborted.Load() {
 		t.Fatal("timed out multipart upload was not aborted")
+	}
+}
+
+func TestHTTPSRequiredForInitialAndRedirectedRequests(t *testing.T) {
+	var plaintextRequests atomic.Int32
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plaintextRequests.Add(1)
+	}))
+	defer plain.Close()
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL, http.StatusTemporaryRedirect)
+	}))
+	defer secure.Close()
+	base := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		tr.TLSClientConfig = secure.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	})
+	client := withIdleTimeout(base, time.Second, false)
+	for _, endpoint := range []string{plain.URL, secure.URL} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, endpoint, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if err == nil || !strings.Contains(err.Error(), "S3_ALLOW_HTTP") || plaintextRequests.Load() != 0 {
+			t.Fatalf("request to %s: err=%v plaintextRequests=%d", endpoint, err, plaintextRequests.Load())
+		}
 	}
 }

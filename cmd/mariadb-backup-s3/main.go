@@ -42,7 +42,7 @@ func run() int {
 		case <-ctx.Done():
 		}
 	}()
-	c, err := backup.LoadConfig()
+	c, err := backup.LoadConfig(command)
 	if err == nil {
 		var store *storage.S3
 		store, err = storage.New(ctx, c.Storage)

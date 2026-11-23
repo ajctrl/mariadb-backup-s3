@@ -111,7 +111,7 @@ func TestStreamingFailuresStopOtherProcessesAndReleaseLock(t *testing.T) {
 				f := streamingFixture(t, true)
 				f.env["BACKUP_MODE"] = backupMode
 				if stage == "S3" {
-					f.s3.uploadFailure = ".sql"
+					f.s3.fail = "part"
 				} else {
 					f.env["STREAM_GPG_EXIT"] = "1"
 				}
@@ -129,6 +129,7 @@ func TestStreamingFailuresStopOtherProcessesAndReleaseLock(t *testing.T) {
 				f.assertClean()
 				next := newFixture(t)
 				next.env["MARIADB_DATABASE"] = "app"
+				next.env["S3_ENDPOINT"] = f.env["S3_ENDPOINT"]
 				next.run(true, "backup")
 			})
 		}

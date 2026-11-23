@@ -3,9 +3,13 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -43,7 +47,7 @@ func testS3(t *testing.T, handler http.HandlerFunc) *S3 {
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	s, err := New(context.Background(), Config{
-		Bucket: "test-bucket", Region: "us-west-1", Endpoint: server.URL,
+		Bucket: "test-bucket", Region: "us-west-1", AllowHTTP: true, Endpoint: server.URL,
 		AccessKeyID: "test-key", SecretAccessKey: "test-secret", SessionToken: "test-token",
 	})
 	if err != nil {
@@ -85,7 +89,7 @@ func TestS3SignedRequestsAndFileRoundTrip(t *testing.T) {
 			writeXML(w, `<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`)
 			return
 		}
-		if r.URL.Path != "/test-bucket/"+key {
+		if !r.URL.Query().Has("delete") && r.URL.Path != "/test-bucket/"+key {
 			t.Errorf("object key changed: %q", r.URL.Path)
 		}
 		switch r.Method {
@@ -100,17 +104,26 @@ func TestS3SignedRequestsAndFileRoundTrip(t *testing.T) {
 			if r.URL.Query().Get("versionId") != versionID {
 				t.Errorf("version ID changed: %q", r.URL.RawQuery)
 			}
+			w.Header().Set("x-amz-version-id", versionID)
 			w.Header().Set("ETag", `"test-etag"`)
 			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload)))
-			w.WriteHeader(http.StatusPartialContent)
+
+			w.WriteHeader(http.StatusOK)
 			w.Write(payload)
-		case http.MethodDelete:
+		case http.MethodPost:
 			if r.URL.Query().Has("versionId") {
 				t.Error("retention must not delete a historical version")
 			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			md := md5.Sum(body)
+			if got := r.Header.Get("Content-MD5"); got != base64.StdEncoding.EncodeToString(md[:]) {
+				t.Errorf("incorrect DeleteObjects Content-MD5 header %q", got)
+			}
 			deleted.Store(true)
-			w.WriteHeader(http.StatusNoContent)
+			writeXML(w, "<DeleteResult><Deleted><Key>"+key+"</Key></Deleted></DeleteResult>")
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 			w.WriteHeader(http.StatusBadRequest)
@@ -124,25 +137,26 @@ func TestS3SignedRequestsAndFileRoundTrip(t *testing.T) {
 	if err := os.WriteFile(path, payload, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Upload(ctx, key, openUpload(t, path)); err != nil {
+	if err := s.Upload(ctx, key, openUpload(t, path), false); err != nil {
 		t.Fatal(err)
 	}
 	if uploaded.Load() == nil || !bytes.Equal(uploaded.Load().([]byte), payload) {
 		t.Fatalf("uploaded body differs: %q", uploaded.Load())
 	}
-	destination := filepath.Join(t.TempDir(), "restored.dump")
-	if err := s.Download(ctx, key, versionID, destination); err != nil {
+	destination, err := s.Download(ctx, key, versionID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	downloaded, err := os.ReadFile(destination)
+	defer destination.Close()
+	downloaded, err := io.ReadAll(destination)
 	if err != nil || !bytes.Equal(downloaded, payload) {
 		t.Fatalf("download = %q, %v", downloaded, err)
 	}
-	info, err := os.Stat(destination)
+	info, err := destination.Stat()
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("download permissions = %v, %v", info, err)
 	}
-	if err := s.Delete(ctx, key); err != nil || !deleted.Load() {
+	if err := s.Delete(ctx, []Object{{Key: key, ETag: "test"}}); err != nil || !deleted.Load() {
 		t.Fatalf("delete = %v, deleted = %v", err, deleted.Load())
 	}
 }
@@ -174,7 +188,8 @@ func TestS3ListAllPages(t *testing.T) {
 		body.WriteString("</ListBucketResult>")
 		writeXML(w, body.String())
 	})
-	objects, err := s.List(context.Background(), "/backup//odd database_")
+	var objects []Object
+	err := s.List(context.Background(), "/backup//odd database_", func(obj Object, _ time.Time) error { objects = append(objects, obj); return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,8 +204,10 @@ func TestS3ListAllPages(t *testing.T) {
 
 func TestS3RejectsIncompleteListings(t *testing.T) {
 	for _, test := range []struct{ name, response string }{
-		{"missing date", "<Contents><Key>old.dump</Key></Contents>"},
-		{"missing key", "<Contents><LastModified>2026-09-12T11:20:30Z</LastModified></Contents>"},
+		{"missing date", "<IsTruncated>false</IsTruncated><Contents><Key>old.dump</Key></Contents>"},
+		{"missing key", "<IsTruncated>false</IsTruncated><Contents><LastModified>2026-09-12T11:20:30Z</LastModified></Contents>"},
+		{"missing truncation flag", "<NextContinuationToken>next</NextContinuationToken>"},
+		{"token on final page", "<IsTruncated>false</IsTruncated><NextContinuationToken>next</NextContinuationToken>"},
 		{"missing token", "<IsTruncated>true</IsTruncated>"},
 		{"repeated token", "<IsTruncated>true</IsTruncated><NextContinuationToken>again</NextContinuationToken>"},
 	} {
@@ -203,112 +220,125 @@ func TestS3RejectsIncompleteListings(t *testing.T) {
 				}
 				writeXML(w, "<ListBucketResult>"+test.response+"</ListBucketResult>")
 			})
-			objects, err := s.List(context.Background(), "backup/")
-			if err == nil || objects != nil || calls.Load() > 2 {
-				t.Fatalf("unsafe listing: objects = %v, err = %v, calls = %d", objects, err, calls.Load())
+			err := s.List(context.Background(), "backup/", func(Object, time.Time) error { return nil })
+			if err == nil || calls.Load() > 2 {
+				t.Fatalf("unsafe listing: err = %v, calls = %d", err, calls.Load())
 			}
 		})
 	}
 }
 
 func TestS3MultipartUpload(t *testing.T) {
-	const partSize = 5 * 1024 * 1024
-	payload := bytes.Repeat([]byte("dump-part-"), (2*partSize)/10+100)
-	var mu sync.Mutex
-	parts := make(map[int][]byte)
-	var completed atomic.Bool
-	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		switch {
-		case r.Method == http.MethodPost && q.Has("uploads"):
-			writeXML(w, "<InitiateMultipartUploadResult><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>")
-		case r.Method == http.MethodPut && q.Get("uploadId") == "upload-id":
-			n, _ := strconv.Atoi(q.Get("partNumber"))
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Error(err)
+	for _, disk := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disk=%t", disk), func(t *testing.T) {
+			const partSize = 5 * 1024 * 1024
+			payload := bytes.Repeat([]byte("dump-part-"), (2*partSize)/10+100)
+			var mu sync.Mutex
+			parts := make(map[int][]byte)
+			var completed atomic.Bool
+			s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				switch {
+				case r.Method == http.MethodPost && q.Has("uploads"):
+					writeXML(w, "<InitiateMultipartUploadResult><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>")
+				case r.Method == http.MethodPut && q.Get("uploadId") == "upload-id":
+					n, _ := strconv.Atoi(q.Get("partNumber"))
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+					}
+					mu.Lock()
+					parts[n] = body
+					mu.Unlock()
+					w.Header().Set("ETag", fmt.Sprintf(`"part-%d"`, n))
+				case r.Method == http.MethodPost && q.Get("uploadId") == "upload-id":
+					if r.Header.Get("If-None-Match") != "*" || r.Header.Get("X-Amz-Checksum-Crc32") != base64.StdEncoding.EncodeToString(binary.BigEndian.AppendUint32(nil, crc32.ChecksumIEEE(payload))) {
+						t.Error("missing upload condition or checksum")
+					}
+					var body struct {
+						Parts []struct {
+							Number int    `xml:"PartNumber"`
+							ETag   string `xml:"ETag"`
+						} `xml:"Part"`
+					}
+					if err := xml.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					if len(body.Parts) != 3 {
+						t.Errorf("completion parts = %d", len(body.Parts))
+					}
+					for i, part := range body.Parts {
+						if part.Number != i+1 || part.ETag != fmt.Sprintf(`"part-%d"`, i+1) {
+							t.Errorf("completion part = %+v", part)
+						}
+					}
+					completed.Store(true)
+					writeXML(w, `<CompleteMultipartUploadResult><ETag>"completed"</ETag></CompleteMultipartUploadResult>`)
+				default:
+					t.Errorf("unexpected multipart request: %s %s", r.Method, r.URL)
+					writeS3Error(w, http.StatusBadRequest, "BadRequest")
+				}
+			})
+			s.diskUpload = disk
+			s.uploadPartSize = partSize
+			path := filepath.Join(t.TempDir(), "large.dump")
+			if err := os.WriteFile(path, payload, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Upload(context.Background(), "large.dump", openUpload(t, path), true); err != nil {
+				t.Fatal(err)
 			}
 			mu.Lock()
-			parts[n] = body
-			mu.Unlock()
-			w.Header().Set("ETag", fmt.Sprintf(`"part-%d"`, n))
-		case r.Method == http.MethodPost && q.Get("uploadId") == "upload-id":
-			var body struct {
-				Parts []struct {
-					Number int    `xml:"PartNumber"`
-					ETag   string `xml:"ETag"`
-				} `xml:"Part"`
+			defer mu.Unlock()
+			if len(parts) != 3 || !completed.Load() {
+				t.Fatalf("parts = %d, completed = %v", len(parts), completed.Load())
 			}
-			if err := xml.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Error(err)
+			joined := append(append(parts[1], parts[2]...), parts[3]...)
+			if !bytes.Equal(joined, payload) {
+				t.Error("multipart upload changed the dump contents")
 			}
-			if len(body.Parts) != 3 {
-				t.Errorf("completion parts = %d", len(body.Parts))
-			}
-			for i, part := range body.Parts {
-				if part.Number != i+1 || part.ETag != fmt.Sprintf(`"part-%d"`, i+1) {
-					t.Errorf("completion part = %+v", part)
-				}
-			}
-			completed.Store(true)
-			writeXML(w, `<CompleteMultipartUploadResult><ETag>"completed"</ETag></CompleteMultipartUploadResult>`)
-		default:
-			t.Errorf("unexpected multipart request: %s %s", r.Method, r.URL)
-			writeS3Error(w, http.StatusBadRequest, "BadRequest")
-		}
-	})
-	s.uploadPartSize = partSize
-	path := filepath.Join(t.TempDir(), "large.dump")
-	if err := os.WriteFile(path, payload, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Upload(context.Background(), "large.dump", openUpload(t, path)); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(parts) != 3 || !completed.Load() {
-		t.Fatalf("parts = %d, completed = %v", len(parts), completed.Load())
-	}
-	joined := append(append(parts[1], parts[2]...), parts[3]...)
-	if !bytes.Equal(joined, payload) {
-		t.Error("multipart upload changed the dump contents")
+		})
 	}
 }
 
 func TestS3CanceledMultipartUploadIsAborted(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var aborted atomic.Bool
-	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
-			writeXML(w, "<InitiateMultipartUploadResult><UploadId>canceled-upload</UploadId></InitiateMultipartUploadResult>")
-		case r.Method == http.MethodPut:
-			cancel()
-			writeS3Error(w, http.StatusForbidden, "AccessDenied")
-		case r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "canceled-upload":
-			aborted.Store(true)
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
-			writeS3Error(w, http.StatusBadRequest, "BadRequest")
-		}
-	})
-	path := filepath.Join(t.TempDir(), "large.dump")
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(20 * 1024 * 1024); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	if err := s.Upload(ctx, "large.dump", openUpload(t, path)); err == nil {
-		t.Fatal("canceled upload succeeded")
-	}
-	if !aborted.Load() {
-		t.Error("multipart upload was not aborted after cancellation")
+	for _, disk := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disk=%t", disk), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var aborted atomic.Bool
+			s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+					writeXML(w, "<InitiateMultipartUploadResult><UploadId>canceled-upload</UploadId></InitiateMultipartUploadResult>")
+				case r.Method == http.MethodPut:
+					cancel()
+					writeS3Error(w, http.StatusForbidden, "AccessDenied")
+				case r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "canceled-upload":
+					aborted.Store(true)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					writeS3Error(w, http.StatusBadRequest, "BadRequest")
+				}
+			})
+			s.diskUpload = disk
+			path := filepath.Join(t.TempDir(), "large.dump")
+			f, err := os.Create(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Truncate(20 * 1024 * 1024); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+			if err := s.Upload(ctx, "large.dump", openUpload(t, path), false); err == nil {
+				t.Fatal("canceled upload succeeded")
+			}
+			if !aborted.Load() {
+				t.Error("multipart upload was not aborted after cancellation")
+			}
+		})
 	}
 }
 
@@ -317,6 +347,23 @@ func TestS3FailedDownloadKeepsDestination(t *testing.T) {
 		name    string
 		respond http.HandlerFunc
 	}{
+		{"short body", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "64")
+			fmt.Fprint(w, "short")
+		}},
+		{"invalid full-object checksum", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Amz-Checksum-Crc32", "AAAAAA==")
+			fmt.Fprint(w, "short")
+		}},
+		{"partial status without range", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusPartialContent)
+			fmt.Fprint(w, "short")
+		}},
+		{"unexpected partial response", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Range", "bytes 0-4/64")
+			w.WriteHeader(206)
+			fmt.Fprint(w, "short")
+		}},
 		{"missing", func(w http.ResponseWriter, _ *http.Request) {
 			writeS3Error(w, http.StatusNotFound, "NoSuchKey")
 		}},
@@ -335,7 +382,8 @@ func TestS3FailedDownloadKeepsDestination(t *testing.T) {
 			if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.Download(t.Context(), "backup.dump", "", path); err == nil {
+			t.Setenv("TMPDIR", dir)
+			if f, err := s.Download(t.Context(), "backup.dump", ""); err == nil || f != nil {
 				t.Fatal("invalid backup download succeeded")
 			}
 			body, _ := os.ReadFile(path)
@@ -347,42 +395,30 @@ func TestS3FailedDownloadKeepsDestination(t *testing.T) {
 	}
 }
 
-func TestS3MultipartDownloadPinsObject(t *testing.T) {
-	payload := bytes.Repeat([]byte("restored-part-"), 1400000)
-	for _, versionID := range []string{"", "old+version/=id"} {
-		t.Run("version="+versionID, func(t *testing.T) {
-			var requests atomic.Int32
-			s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
-				requests.Add(1)
-				var start, end int
-				if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || start >= len(payload) {
-					t.Errorf("invalid download range: %q", r.Header.Get("Range"))
-					writeS3Error(w, http.StatusBadRequest, "BadRequest")
-					return
-				}
-				if versionID != "" {
-					if r.URL.Query().Get("versionId") != versionID {
-						t.Error("historical version was not requested on every part")
-					}
-				} else if start > 0 && r.Header.Get("If-Match") != `"same-object"` {
-					t.Error("latest object was not pinned to its original ETag")
-				}
-				end = min(end, len(payload)-1)
-				w.Header().Set("ETag", `"same-object"`)
-				w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
-				w.WriteHeader(http.StatusPartialContent)
-				w.Write(payload[start : end+1])
-			})
-			path := filepath.Join(t.TempDir(), "large.dump")
-			if err := s.Download(context.Background(), "latest.dump", versionID, path); err != nil {
-				t.Fatal(err)
+func TestDownloadReadsSingleGeneration(t *testing.T) {
+	data := bytes.Repeat([]byte("SQL "), 3<<20)
+	for _, version := range []string{"", "null", "old-version"} {
+		var calls atomic.Int32
+		s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if r.Header.Get("Range") != "" || r.URL.Query().Get("versionId") != version {
+				t.Error("unexpected range or version")
 			}
-			body, err := os.ReadFile(path)
-			if err != nil || !bytes.Equal(body, payload) || requests.Load() != 3 {
-				t.Fatalf("multipart download: err = %v, requests = %d, bytes = %d", err, requests.Load(), len(body))
+			if version != "" {
+				w.Header().Set("x-amz-version-id", version)
 			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.Write(data)
 		})
+		file, err := s.Download(t.Context(), "db.sql", version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(file)
+		file.Close()
+		if err != nil || !bytes.Equal(got, data) || calls.Load() != 1 {
+			t.Fatal("incomplete or mixed download")
+		}
 	}
 }
 
@@ -445,10 +481,10 @@ func TestS3DisabledVersioningAndCancellation(t *testing.T) {
 	cancel()
 	for name, operation := range map[string]func() error{
 		"versioning": func() error { _, err := s.VersioningEnabled(ctx); return err },
-		"upload":     func() error { return s.Upload(ctx, "key", io.NopCloser(strings.NewReader("unused"))) },
-		"download":   func() error { return s.Download(ctx, "key", "", "missing") },
-		"list":       func() error { _, err := s.List(ctx, ""); return err },
-		"delete":     func() error { return s.Delete(ctx, "key") },
+		"upload":     func() error { return s.Upload(ctx, "key", io.NopCloser(strings.NewReader("unused")), false) },
+		"download":   func() error { _, err := s.Download(ctx, "key", ""); return err },
+		"list":       func() error { return s.List(ctx, "", nil) },
+		"delete":     func() error { return s.Delete(ctx, []Object{{Key: "key", ETag: "test"}}) },
 	} {
 		if err := operation(); !errors.Is(err, context.Canceled) {
 			t.Errorf("%s cancellation = %v", name, err)
@@ -460,6 +496,7 @@ func TestS3ConfigurationValidation(t *testing.T) {
 	isolatedAWS(t)
 	for _, cfg := range []Config{
 		{},
+		{Bucket: "test", Endpoint: "http://localhost:9000"},
 		{Bucket: "test", Endpoint: "localhost:9000"},
 		{Bucket: "test", Endpoint: "https://user:password@example.com"},
 		{Bucket: "test", Endpoint: "https://example.com?token=secret"},
@@ -491,4 +528,87 @@ func openUpload(t *testing.T, path string) *os.File {
 	}
 	t.Cleanup(func() { f.Close() })
 	return f
+}
+
+func TestDeleteReportsIndividualPreconditionFailure(t *testing.T) {
+	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+		writeXML(w, "<DeleteResult><Error><Key>backup.sql</Key><Code>PreconditionFailed</Code></Error></DeleteResult>")
+	})
+	if err := s.Delete(t.Context(), []Object{{Key: "backup.sql", ETag: "old"}}); err == nil || !strings.Contains(err.Error(), "PreconditionFailed") {
+		t.Fatalf("conditional delete returned %v", err)
+	}
+}
+
+func TestUploadRequiresAcknowledgment(t *testing.T) {
+	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+	for _, disk := range []bool{false, true} {
+		s.diskUpload = disk
+		err := s.Upload(t.Context(), "backup.sql", io.NopCloser(strings.NewReader("SELECT 1;")), true)
+		if err == nil || !strings.Contains(err.Error(), "ETag") {
+			t.Fatalf("upload with disk=%t returned %v", disk, err)
+		}
+	}
+}
+
+func TestDeleteRequiresAcknowledgmentForEveryKey(t *testing.T) {
+	for _, keys := range [][]string{nil, {"a"}, {"a", "a"}, {"a", "other"}} {
+		s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+			out := "<DeleteResult>"
+			for _, key := range keys {
+				out += "<Deleted><Key>" + key + "</Key></Deleted>"
+			}
+			writeXML(w, out+"</DeleteResult>")
+		})
+		if err := s.Delete(t.Context(), []Object{{Key: "a", ETag: "aa"}, {Key: "b", ETag: "bb"}}); err == nil {
+			t.Fatalf("accepted deletion response with keys %v", keys)
+		}
+	}
+}
+
+func TestRetentionUsesResolvedEndpoint(t *testing.T) {
+	for _, setting := range []string{"", "S3_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "profile"} {
+		t.Run(setting, func(t *testing.T) {
+			isolatedAWS(t)
+			cfg := Config{Bucket: "test"}
+			const endpoint = "https://storage.example"
+			switch setting {
+			case "":
+			case "S3_ENDPOINT":
+				cfg.Endpoint = endpoint
+			case "profile":
+				if err := os.WriteFile(os.Getenv("AWS_CONFIG_FILE"), []byte("[default]\nendpoint_url = "+endpoint+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				t.Setenv(setting, endpoint)
+			}
+			s, err := New(t.Context(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.ManagesRetention() != (setting == "") {
+				t.Fatalf("unexpected retention policy for %q", setting)
+			}
+		})
+	}
+}
+
+func TestDownloadRequiresRequestedVersion(t *testing.T) {
+	for _, returned := range []string{"", "another", "null"} {
+		t.Run("response_"+returned, func(t *testing.T) {
+			s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+				if returned != "" {
+					w.Header().Set("x-amz-version-id", returned)
+				}
+				io.WriteString(w, "SQL")
+			})
+			if f, err := s.Download(t.Context(), "key", "requested"); err == nil {
+				f.Close()
+				t.Fatal("accepted unconfirmed generation")
+			}
+		})
+	}
 }

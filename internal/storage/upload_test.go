@@ -52,7 +52,7 @@ func TestStreamingUploadRejectsProducerFailure(t *testing.T) {
 			})
 			sourceErr := errors.New("mariadb-dump failed after emitting data")
 			body := io.NopCloser(failingStream{Reader: bytes.NewReader(make([]byte, size)), err: sourceErr})
-			if err := s.Upload(t.Context(), "latest.dump", body); !errors.Is(err, sourceErr) {
+			if err := s.Upload(t.Context(), "latest.dump", body, false); !errors.Is(err, sourceErr) {
 				t.Fatalf("producer failure was lost: %v", err)
 			}
 			if published.Load() || initiated.Load() != aborted.Load() || initiated.Load() != (size > 8*1024*1024) {
@@ -88,7 +88,7 @@ func TestStreamingUploadPartFailureInterruptsBlockedProducer(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	err := s.Upload(ctx, "latest.dump", reader)
+	err := s.Upload(ctx, "latest.dump", reader, false)
 	<-written
 	if err == nil || !strings.Contains(err.Error(), "AccessDenied") || ctx.Err() != nil || !aborted.Load() {
 		t.Fatalf("err=%v outer context=%v aborted=%v", err, ctx.Err(), aborted.Load())
@@ -101,7 +101,7 @@ func TestStreamingUploadCancellationInterruptsInitialRead(t *testing.T) {
 	defer writer.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- s.Upload(ctx, "key", reader) }()
+	go func() { done <- s.Upload(ctx, "key", reader, false) }()
 	if _, err := writer.Write([]byte("partial")); err != nil {
 		t.Fatal(err)
 	}
@@ -160,12 +160,30 @@ func TestStreamingUploadRetriesBufferedPart(t *testing.T) {
 	})
 	// NopCloser hides Seek: retries must use the SDK's bounded part buffer.
 	body := io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("data"), 3*1024*1024)))
-	if err := s.Upload(t.Context(), "key", body); err != nil {
+	if err := s.Upload(t.Context(), "key", body, false); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if attempts != 2 || !completed.Load() {
 		t.Fatalf("first part attempts=%d completed=%v", attempts, completed.Load())
+	}
+}
+
+func TestMissingMultipartIDStopsBeforeUploadingParts(t *testing.T) {
+	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+		if !r.URL.Query().Has("uploads") {
+			t.Errorf("unexpected request after missing upload ID: %s", r.URL.Path)
+		}
+		writeXML(w, "<InitiateMultipartUploadResult/>")
+	})
+	s.uploadPartSize = 5 << 20
+	payload := make([]byte, s.uploadPartSize+1)
+	for _, disk := range []bool{false, true} {
+		s.diskUpload = disk
+		err := s.Upload(t.Context(), "backup.sql", io.NopCloser(bytes.NewReader(payload)), true)
+		if err == nil || !strings.Contains(err.Error(), "upload ID") {
+			t.Fatalf("disk=%t returned %v", disk, err)
+		}
 	}
 }

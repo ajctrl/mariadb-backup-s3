@@ -34,7 +34,11 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	cliBinary = filepath.Join(dir, "mariadb-backup-s3")
-	build := exec.Command("go", "build", "-o", cliBinary, "./cmd/mariadb-backup-s3")
+	args := []string{"build"}
+	if os.Getenv("CLI_TEST_RACE") == "1" {
+		args = append(args, "-race")
+	}
+	build := exec.Command("go", append(args, "-o", cliBinary, "./cmd/mariadb-backup-s3")...)
 	build.Dir = ".."
 	if output, err := build.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "build CLI: %v\n%s", err, output)
@@ -50,6 +54,22 @@ const fakeTool = `#!/bin/sh
 set -eu
 command=${0##*/}
 line=$command
+for arg do
+ case "$arg" in --xml) [ "${FAKE_ROLE_LOOKUP_FAILURE:-}" != true ] || exit 1; exit 0;; esac
+ case "$arg" in --unbuffered)
+  [ -z "${FAKE_LOCK_PID:-}" ] || printf '%s\n' "$$" > "$FAKE_LOCK_PID"
+  while IFS= read -r query; do
+    case "$query" in
+      *"SELECT GET_LOCK("* ) printf '%s\t0\t%s\t\n' "${FAKE_LOCK_RESULT:-1}" "${FAKE_MAX_PACKET:-16777216}";;
+      "SELECT IS_USED_LOCK("* ) printf '%s\n' "${FAKE_LOCK_RESULT:-1}";;
+      *) first_sql=$query; break;;
+    esac
+  done
+  [ "${first_sql+x}" = x ] || exit 0
+  break;; esac
+ case "$arg" in --raw) metadata_candidate=true;; esac
+done
+case "$*:${metadata_candidate:-}" in *--execute=*) ;; *:true) cat >/dev/null; printf '%s\n' metadata >> "$FAKE_LOG"; printf '%s' "${FAKE_TABLE_METADATA:-}"; exit 0;; esac
 for arg do line="$line	$arg"; done
 printf '%s\n' "$line" >> "$FAKE_LOG"
 database=''
@@ -59,7 +79,6 @@ previous=''
 decrypt=false
 discovery=false
 positional=false
-source=''
 passphrase_fd=''
 for arg do
   case "$previous" in --output|-o) output=$arg;; esac
@@ -77,15 +96,14 @@ for arg do
   fi
   [ "$arg" != --decrypt ] || decrypt=true
   previous=$arg
-  source=$arg
 done
 [ -z "${PASSPHRASE:-}" ] || exit 12
 if [ "$command" != gpg ]; then
   [ -z "${MARIADB_PASSWORD:-}" ] || exit 9
   [ -z "${MYSQL_PWD:-}" ] || exit 10
   case "$1" in --defaults-file=*) defaults=${1#--defaults-file=};; *) exit 6;; esac
-  [ "$(stat -c %a "$defaults")" = 600 ] || exit 7
-  [ "$(stat -c %a "${defaults%/*}")" = 700 ] || exit 8
+  [ "$(stat -Lc %a "$defaults")" = 600 ] || exit 7
+  case "$(readlink "$defaults")" in *" (deleted)") ;; *) exit 8;; esac
   [ -z "${FAKE_DEFAULTS_SNAPSHOT:-}" ] || cp "$defaults" "$FAKE_DEFAULTS_SNAPSHOT"
 else
   case "$passphrase_fd" in 3|4) ;; *) exit 13;; esac
@@ -105,7 +123,7 @@ case "$command" in
       [ "${FAKE_DISCOVERY_FAILURE:-}" != true ] || exit 1
       cat "$FAKE_DATABASES_FILE"
     else
-      payload=$(cat)
+      payload=$(printf '%s\n' "$first_sql"; cat)
       case "$payload" in '-- SQL'*) ;; *) exit 3;; esac
       [ -z "${FAKE_RESTORE_INPUT:-}" ] || printf '%s\n' "$payload" > "$FAKE_RESTORE_INPUT"
       [ "${FAKE_RESTORE_FAILURE:-}" != true ] || exit 1
@@ -123,10 +141,11 @@ case "$command" in
     ;;
   gpg)
     if [ "$decrypt" = true ]; then
+      payload=$(cat)
       if [ -n "${FAKE_GPG_FAILURE:-}" ]; then
-        case "$(cat "$source")" in *"$FAKE_GPG_FAILURE"*) exit 1;; esac
+        case "$payload" in *"$FAKE_GPG_FAILURE"*) exit 1;; esac
       fi
-      if [ -n "$output" ]; then cp "$source" "$output"; else cat "$source"; fi
+      printf '%s\n' "$payload"
     else
       payload=$(cat)
       if [ -n "${FAKE_GPG_FAILURE:-}" ]; then
@@ -143,6 +162,7 @@ esac
 type object struct {
 	Key          string `xml:"Key"`
 	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
 	Size         int64  `xml:"Size"`
 }
 
@@ -179,6 +199,45 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		key = ""
 	}
 	body, _ := io.ReadAll(r.Body)
+	if query.Has("delete") {
+		var batch struct {
+			Objects []struct{ Key, ETag string } `xml:"Object"`
+		}
+		if err := xml.Unmarshal(body, &batch); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		for _, obj := range batch.Objects {
+			if obj.ETag != "test-etag" {
+				http.Error(w, "missing specific ETag", 400)
+				return
+			}
+			s.mu.Lock()
+			s.requests = append(s.requests, request{"DELETE", obj.Key, query, ""})
+			s.mu.Unlock()
+		}
+		if s.pauseMethod == "DELETE" {
+			s.pauseOnce.Do(func() { close(s.pauseEntered) })
+			select {
+			case <-s.pauseRelease:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if s.fail == "DELETE" {
+			io.WriteString(w, "<DeleteResult><Error><Code>AccessDenied</Code></Error></DeleteResult>")
+			return
+		}
+		result := struct {
+			XMLName xml.Name               `xml:"DeleteResult"`
+			Deleted []struct{ Key string } `xml:"Deleted"`
+		}{}
+		for _, obj := range batch.Objects {
+			result.Deleted = append(result.Deleted, struct{ Key string }{obj.Key})
+		}
+		xml.NewEncoder(w).Encode(result)
+		return
+	}
 	s.mu.Lock()
 	s.requests = append(s.requests, request{r.Method, key, query, string(body)})
 	s.mu.Unlock()
@@ -197,7 +256,7 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if query.Get("list-type") == "2" {
 		action = "list"
 	}
-	if action == s.fail || (action == "PUT" && s.uploadFailure != "" && strings.Contains(key, s.uploadFailure)) {
+	if action == s.fail || (s.fail == "part" && query.Has("partNumber")) || (action == "PUT" && s.uploadFailure != "" && strings.Contains(key, s.uploadFailure)) {
 		w.WriteHeader(http.StatusForbidden)
 		io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>Test failure</Message></Error>`)
 		return
@@ -220,6 +279,7 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var matching []object
 		for _, obj := range s.objects {
 			if strings.HasPrefix(obj.Key, query.Get("prefix")) {
+				obj.ETag = `"test-etag"`
 				matching = append(matching, obj)
 			}
 		}
@@ -243,6 +303,9 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"test-etag"`)
 		w.WriteHeader(http.StatusOK)
 	case "GET":
+		if version := query.Get("versionId"); version != "" {
+			w.Header().Set("x-amz-version-id", version)
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		io.WriteString(w, "-- SQL restored\n")
 	case "DELETE":
@@ -301,7 +364,7 @@ func newFixture(t *testing.T) *fixture {
 	f.env = map[string]string{
 		"PATH":   bin + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"TMPDIR": runtime, "FAKE_LOG": f.log, "FAKE_DATABASES_FILE": filepath.Join(dir, "databases.hex"),
-		"S3_BUCKET": "test-bucket", "S3_PREFIX": "backup", "S3_REGION": "us-west-1", "S3_ENDPOINT": server.URL,
+		"S3_ALLOW_HTTP": "true", "S3_BUCKET": "test-bucket", "S3_PREFIX": "backup", "S3_REGION": "us-west-1", "S3_ENDPOINT": server.URL,
 		"S3_ACCESS_KEY_ID": "test-key", "S3_SECRET_ACCESS_KEY": "test-secret", "AWS_EC2_METADATA_DISABLED": "true",
 		"MARIADB_HOST": "mariadb", "MARIADB_USER": "backup", "MARIADB_PASSWORD": "test",
 	}
@@ -791,9 +854,7 @@ func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
 					t.Fatalf("incorrect failure summary: %s", output)
 				}
 				assertEqual(t, f.databaseCalls("mariadb-dump"), []string{"app", "billing"})
-				lists := f.s3.calls("list")
-				assertEqual(t, len(lists), 1)
-				assertEqual(t, lists[0].Query.Get("prefix"), "backup/billing/")
+				assertEqual(t, len(f.s3.calls("list")), 0)
 				uploads := f.s3.calls("PUT")
 				want := 1
 				if stage == "upload" {
@@ -808,45 +869,18 @@ func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
 	}
 }
 
-func TestRetentionOnlyDeletesExpiredExactTimestampKeys(t *testing.T) {
-	old, recent := "2000-01-01T00:00:00Z", time.Now().UTC().Format(time.RFC3339)
-	for _, mode := range []string{"timestamp", "fixed"} {
-		t.Run(mode, func(t *testing.T) {
-			f := newFixture(t)
-			f.env["MARIADB_DATABASE"], f.env["BACKUP_FILENAME_MODE"], f.env["BACKUP_KEEP_DAYS"] = "app", mode, "7"
-			expired := []string{"backup/app/2000-01-01T00:00:00.sql", "backup/app/2000-01-01T00:00:01.sql.gpg"}
-			for _, key := range expired {
-				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: old})
-			}
-			f.s3.objects = append(f.s3.objects, object{Key: "backup/app/2000-01-01T00:00:02.sql", LastModified: recent})
-			for _, key := range []string{
-				"backup/app_latest.sql", "backup/app_latest.sql.gpg", "backup/app/other_2000-01-01T00:00:00.sql",
-				"backup/app/2000-01-01T00%3A00%3A00/latest.sql", "backup/app_other/2000-01-01T00:00:00.sql",
-				"backup/2000-01-01T00:00:00.sql", "backup/other/2000-01-01T00:00:00.sql",
-				"backup/app/notes.sql", "backup/app/2000-01-01T00:00:00.sql.extra", "backup/app/2000-01-01T00:00:00.sql\n",
-			} {
-				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: old})
-			}
-			f.run(true, "backup")
-			assertEqual(t, keys(f.s3.calls("DELETE")), expired)
-		})
+func TestCustomEndpointUsesBucketLifecycle(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["BACKUP_KEEP_DAYS"] = "7"
+	f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00.sql", LastModified: "2000-01-01T00:00:00Z"}}
+	out := f.run(true, "backup")
+	if !strings.Contains(out, "7-day bucket lifecycle rule") {
+		t.Fatal(out)
 	}
-}
-
-func TestRetentionFailuresReportErrorAndContinue(t *testing.T) {
-	for _, stage := range []string{"list", "DELETE"} {
-		t.Run(stage, func(t *testing.T) {
-			f := newFixture(t)
-			f.env["MARIADB_DATABASES"], f.env["BACKUP_KEEP_DAYS"] = "app,billing", "7"
-			f.s3.fail = stage
-			f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00.sql", LastModified: "2000-01-01T00:00:00Z"}}
-			output := f.run(false, "backup")
-			if !strings.Contains(output, "2 succeeded, 0 failed") {
-				t.Fatalf("incorrect backup summary after retention failure: %s", output)
-			}
-			assertEqual(t, f.databaseCalls("mariadb-dump"), []string{"app", "billing"})
-		})
-	}
+	assertEqual(t, len(f.s3.calls("PUT")), 1)
+	assertEqual(t, len(f.s3.calls("list")), 0)
+	assertEqual(t, len(f.s3.calls("DELETE")), 0)
 }
 
 func TestPrefixLayoutsNormalizeTrailingSlashes(t *testing.T) {
@@ -862,8 +896,7 @@ func TestPrefixLayoutsNormalizeTrailingSlashes(t *testing.T) {
 				oldKey := tc.directory + "2000-01-01T00:00:00.sql"
 				f.s3.objects = []object{{Key: oldKey, LastModified: "2000-01-01T00:00:00Z"}}
 				f.run(true, "backup")
-				assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), tc.directory)
-				assertEqual(t, keys(f.s3.calls("DELETE")), []string{oldKey})
+				assertEqual(t, len(f.s3.calls("DELETE")), 0)
 				if mode == "fixed" {
 					key := strings.TrimSuffix(tc.directory, "app/") + "app_latest.sql"
 					assertEqual(t, keys(f.s3.calls("PUT")), []string{key})
@@ -890,8 +923,10 @@ func TestLatestRestoreExactMatchingAndPagination(t *testing.T) {
 		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2020-01-01T00:00:00Z"})
 	}
 	want := strings.TrimSuffix(f.s3.objects[1000].Key, ".sql") + ".123456789.sql"
+	f.s3.objects = append(f.s3.objects, object{Key: "backup/app/2099-01-01T00:00:00.sql", LastModified: "2010-01-01T00:00:00Z"})
+	f.s3.objects[1000].LastModified = "2025-01-01T00:00:00Z"
 	for _, key := range []string{want, "backup/app/extra_2030-01-01T00:00:00.sql", "backup/app/2025-01-01T00:00:00.sql.gpg", "backup/app/2040-01-01T00%3A00%3A00/latest.sql", "backup/app/9999-99-99T99:99:99.sql"} {
-		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2000-01-01T00:00:00Z"})
+		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2025-01-01T00:00:00Z"})
 	}
 	f.run(true, "restore")
 	assertEqual(t, len(f.s3.calls("list")), 2)
@@ -1013,16 +1048,14 @@ func TestCombinedRetentionAndLatestRestoreStayWithinMode(t *testing.T) {
 			for _, key := range append(append([]string{}, expired...),
 				"backup/app/2000-01-01T00:00:00.sql", "backup/latest.sql",
 				"backup/2000-01-01T00:00:00.sql.extra", "backup/notes.sql") {
-				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2000-01-01T00:00:00Z"})
+				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2025-01-01T00:00:00Z"})
 			}
 			latest := "backup/2020-01-01T00:00:00.sql"
 			for _, key := range []string{latest, "backup/2030-01-01T00:00:00.sql.gpg", "backup/app/2040-01-01T00:00:00.sql"} {
 				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: time.Now().UTC().Format(time.RFC3339)})
 			}
 			f.run(true, "backup")
-			assertEqual(t, keys(f.s3.calls("DELETE")), expired)
-			assertEqual(t, len(f.s3.calls("list")), 1)
-			assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), "backup/")
+			assertEqual(t, len(f.s3.calls("DELETE")), 0)
 			delete(f.env, "MARIADB_DATABASES")
 			f.run(true, "restore")
 			if mode == "fixed" {
@@ -1076,8 +1109,8 @@ func TestCredentialsArePrivateAndRemovedAfterSuccessOrFailure(t *testing.T) {
 				}
 			}
 			credentials := strings.TrimPrefix(calls[0].Args[0], "--defaults-file=")
-			if _, err := os.Stat(filepath.Dir(credentials)); !os.IsNotExist(err) {
-				t.Fatalf("credential directory was not removed: %v", err)
+			if !strings.HasPrefix(credentials, "/proc/self/fd/") {
+				t.Fatal("credential has a persistent pathname")
 			}
 			data, err := os.ReadFile(f.env["FAKE_DEFAULTS_SNAPSHOT"])
 			if err != nil {
@@ -1144,8 +1177,8 @@ func TestRestoreInvalidArgumentsNeverAccessServices(t *testing.T) {
 	}
 }
 
-func TestBackupLockCoversDumpUploadAndRetentionAcrossProcesses(t *testing.T) {
-	for _, stage := range []string{"dump", "PUT", "DELETE"} {
+func TestBackupLockCoversDumpAndUploadAcrossProcesses(t *testing.T) {
+	for _, stage := range []string{"dump", "PUT"} {
 		t.Run(stage, func(t *testing.T) {
 			first := newFixture(t)
 			first.env["MARIADB_DATABASE"], first.env["BACKUP_KEEP_DAYS"] = "app", "7"
@@ -1207,6 +1240,7 @@ func TestBackupLockCoversDumpUploadAndRetentionAcrossProcesses(t *testing.T) {
 			}
 			second := newFixture(t)
 			second.env["MARIADB_DATABASE"] = "app"
+			second.env["S3_ENDPOINT"] = first.env["S3_ENDPOINT"]
 			secondOutput := second.run(false, "backup")
 			if !strings.Contains(secondOutput, "backup lock") {
 				t.Fatalf("overlap failed for a reason other than the shared lock: %s", secondOutput)
@@ -1337,6 +1371,7 @@ func TestScheduledBackupSIGTERMKillsChildAndCleansWorkspace(t *testing.T) {
 	assertEqual(t, len(f.s3.calls("PUT")), 0)
 	next := newFixture(t)
 	next.env["MARIADB_DATABASE"] = "app"
+	next.env["S3_ENDPOINT"] = f.env["S3_ENDPOINT"]
 	next.run(true, "backup")
 }
 
@@ -1349,9 +1384,6 @@ func TestAbruptParentExitKeepsBackupLockUntilDumpChildExits(t *testing.T) {
 	p := f.background("backup")
 	t.Cleanup(func() { os.WriteFile(release, nil, 0600) })
 	waitForFile(t, entered, p)
-	// SIGKILL prevents the parent from removing its private credentials.
-	credentials := strings.TrimPrefix(f.processes("mariadb-dump")[0].Args[0], "--defaults-file=")
-	t.Cleanup(func() { os.RemoveAll(filepath.Dir(credentials)) })
 	pidData, err := os.ReadFile(pidPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1369,6 +1401,7 @@ func TestAbruptParentExitKeepsBackupLockUntilDumpChildExits(t *testing.T) {
 	}
 	next := newFixture(t)
 	next.env["MARIADB_DATABASE"] = "app"
+	next.env["S3_ENDPOINT"] = f.env["S3_ENDPOINT"]
 	output := next.run(false, "backup")
 	if !strings.Contains(output, "backup lock") {
 		t.Fatalf("orphaned dump did not retain the lock: %s", output)
@@ -1391,7 +1424,160 @@ func TestAbruptParentExitKeepsBackupLockUntilDumpChildExits(t *testing.T) {
 	}
 	next.assertClean()
 	assertEqual(t, len(next.processes("mariadb-dump")), 1)
-	assertEqual(t, len(next.s3.calls("PUT")), 1)
-	// SIGKILL cannot execute Go defers; the first workspace is reclaimed by
-	// fixture cleanup. The child must keep the lock despite that parent exit.
+	assertEqual(t, len(f.s3.calls("PUT")), 1)
+	f.assertClean()
+}
+
+func TestTimeoutReleasesBackupLock(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["BACKUP_TIMEOUT"] = "500ms"
+	f.env["FAKE_PAUSE_COMMAND"] = "mariadb-dump"
+	f.env["FAKE_PAUSE_ENTERED"] = filepath.Join(f.dir, "entered")
+	f.env["FAKE_PAUSE_RELEASE"] = filepath.Join(f.dir, "release")
+	if out := f.run(false, "backup"); !strings.Contains(out, "deadline exceeded") {
+		t.Fatal(out)
+	}
+	assertEqual(t, len(f.s3.calls("PUT")), 0)
+	delete(f.env, "FAKE_PAUSE_COMMAND")
+	delete(f.env, "BACKUP_TIMEOUT")
+	f.run(true, "backup")
+}
+
+func TestRestoreRejectsEmptyPlaintext(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"], f.env["BACKUP_FILENAME_MODE"], f.env["PASSPHRASE"] = "app", "fixed", "pass"
+	if err := os.WriteFile(filepath.Join(f.dir, "bin", "gpg"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if out := f.run(false, "restore"); !strings.Contains(out, "empty SQL backup") {
+		t.Fatal(out)
+	}
+	assertEqual(t, len(f.processes("mariadb")), 0)
+}
+
+func TestExternalDataRequiresExplicitPolicy(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["FAKE_TABLE_METADATA"] = "617070\t72656D6F7465\tFEDERATED\n"
+	if out := f.run(false, "backup"); !strings.Contains(out, "app.remote") {
+		t.Fatal(out)
+	}
+	assertEqual(t, len(f.processes("mariadb-dump")), 0)
+	for _, option := range []string{"--ignore-table-data=app.remote", "--no-data-med=0"} {
+		f.env["MARIADB_DUMP_EXTRA_OPTS"] = option
+		f.run(true, "backup")
+	}
+}
+
+func TestRestoreIgnoresBackupOnlyConfiguration(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["S3_UPLOAD_BUFFER"] = "invalid"
+	f.env["S3_UPLOAD_PART_SIZE_MB"] = "invalid"
+	f.env["BACKUP_TIMEOUT"] = "invalid"
+	f.env["BACKUP_ALLOW_UNVERSIONED_OVERWRITE"] = "invalid"
+	f.run(true, "restore", "2026-01-01T00:00:00")
+	assertEqual(t, f.databaseCalls("mariadb"), []string{"app"})
+}
+
+func TestServerLockContentionStopsBackupAndRestoreBeforeS3(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["FAKE_LOCK_RESULT"] = "0"
+	for _, command := range []string{"backup", "restore"} {
+		f.env["S3_PREFIX"] = command
+		if out := f.run(false, command); !strings.Contains(out, "server is busy") {
+			t.Fatal(out)
+		}
+	}
+	assertEqual(t, len(f.s3.requests), 0)
+	assertEqual(t, len(f.processes("mariadb-dump")), 0)
+	assertEqual(t, len(f.databaseCalls("mariadb")), 0)
+}
+
+func TestPreflightChecksManyDiscoveredDatabases(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = ""
+	f.env["MARIADB_BACKUP_ALL"] = "true"
+	f.env["BACKUP_MODE"] = "combined"
+	var databases []string
+	for i := range 450 {
+		databases = append(databases, fmt.Sprintf("%064d", i))
+	}
+	f.databases(databases)
+	f.run(true, "backup")
+	assertEqual(t, len(f.processes("metadata")), 15)
+	assertEqual(t, len(f.processes("mariadb-dump")), 1)
+}
+
+func TestDataExclusionStillRequiresTriggerPrivilege(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["FAKE_TABLE_METADATA"] = "617070\t6c6f67\tmissing TRIGGER\n"
+	f.env["MARIADB_DUMP_EXTRA_OPTS"] = "--ignore-table-data=app.log"
+	if out := f.run(false, "backup"); !strings.Contains(out, "TRIGGER") {
+		t.Fatal(out)
+	}
+	f.env["MARIADB_DUMP_EXTRA_OPTS"] = "--ignore-table=app.log"
+	f.run(true, "backup")
+}
+
+func TestLockConnectionLossStopsRunningDump(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["FAKE_LOCK_PID"] = filepath.Join(f.dir, "lock.pid")
+	f.env["FAKE_PAUSE_COMMAND"] = "mariadb-dump"
+	f.env["FAKE_PAUSE_ENTERED"] = filepath.Join(f.dir, "entered")
+	f.env["FAKE_PAUSE_RELEASE"] = filepath.Join(f.dir, "release")
+	p := f.background("backup")
+	waitForFile(t, f.env["FAKE_PAUSE_ENTERED"], p)
+	data, err := os.ReadFile(f.env["FAKE_LOCK_PID"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.wait(t); err == nil {
+		t.Fatal("backup continued after lock connection loss")
+	}
+	assertEqual(t, completedUploads(f), 0)
+}
+
+func TestEncryptedRestoreLeavesNoNamedSQLAfterAbruptExit(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["BACKUP_FILENAME_MODE"] = "fixed"
+	f.env["PASSPHRASE"] = "test passphrase"
+	f.env["FAKE_PAUSE_COMMAND"] = "mariadb"
+	f.env["FAKE_PAUSE_ENTERED"] = filepath.Join(f.dir, "entered")
+	release := filepath.Join(f.dir, "release")
+	f.env["FAKE_PAUSE_RELEASE"] = release
+	p := f.background("restore")
+	t.Cleanup(func() { os.WriteFile(release, nil, 0600) })
+	waitForFile(t, f.env["FAKE_PAUSE_ENTERED"], p)
+	f.assertClean()
+	if err := p.cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if p.wait(t) == nil {
+		t.Fatal("killed restore returned success")
+	}
+	f.assertClean()
+}
+
+func TestVisibilityWarningsRemainAdvisory(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	f.env["FAKE_ROLE_LOOKUP_FAILURE"] = "true"
+	f.env["FAKE_TABLE_METADATA"] = "617070\t\tmissing SELECT\n617070\t\tmissing routine access\n"
+	out := f.run(true, "backup")
+	if !strings.Contains(out, "schema-wide SELECT") || !strings.Contains(out, "routine definitions") || len(f.s3.calls("PUT")) != 1 {
+		t.Fatalf("expected both warnings and one published backup: %s", out)
+	}
 }

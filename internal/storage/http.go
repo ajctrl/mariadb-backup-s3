@@ -3,8 +3,10 @@ package storage
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -14,8 +16,21 @@ import (
 // Keep the SDK's proxy, custom CA and connection settings, but bound inactivity
 // without imposing a deadline on the total transfer. NewFromConfig resolves the
 // SDK's BuildableClient before invoking our option; Config exposes no custom client.
-func withIdleTimeout(client aws.HTTPClient, timeout time.Duration) aws.HTTPClient {
+func withIdleTimeout(client aws.HTTPClient, timeout time.Duration, allowHTTP bool) aws.HTTPClient {
 	return client.(*awshttp.BuildableClient).WithReadTimeout(0).WithTransportOptions(func(tr *http.Transport) {
+		// The transport runs this hook on every request, including SDK redirects.
+		if !allowHTTP {
+			proxy := tr.Proxy
+			tr.Proxy = func(req *http.Request) (*url.URL, error) {
+				if req.URL.Scheme != "https" {
+					return nil, fmt.Errorf("HTTP S3 endpoint requires S3_ALLOW_HTTP=true")
+				}
+				if proxy == nil {
+					return nil, nil
+				}
+				return proxy(req)
+			}
+		}
 		// One request per connection ensures traffic from another HTTP/2 stream
 		// cannot keep a stalled request alive. This matches the previous AWS CLI.
 		tr.ForceAttemptHTTP2 = false

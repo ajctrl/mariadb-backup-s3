@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -20,7 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-const defaultS3TestImage = "quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+const defaultS3TestImage = "docker.io/jcometki/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
 
 // TestDockerBackupRestore requires a local Docker daemon and an already-built
 // backup image. All credentials, containers and stored data belong to this test.
@@ -80,6 +81,9 @@ func TestDockerBackupRestore(t *testing.T) {
 		return strings.TrimSpace(docker(t, ctx, "exec", mariadb, "mariadb", "--host=127.0.0.1", "--user=root", "--password=integration-password", "--batch", "--skip-column-names", "--execute", query))
 	}
 	sql(t, `
+		CREATE TABLE app.history_probe (v INT) WITH SYSTEM VERSIONING;
+		INSERT INTO app.history_probe VALUES (1);
+		UPDATE app.history_probe SET v=2;
 		CREATE TABLE app.backup_probe (id INT PRIMARY KEY, value TEXT NOT NULL, payload VARBINARY(32) NOT NULL) ENGINE=InnoDB;
 		INSERT INTO app.backup_probe VALUES (1, 'original', UNHEX('0001FF275C0A'));
 		CREATE VIEW app.probe_view AS SELECT id, value FROM app.backup_probe;
@@ -102,9 +106,10 @@ func TestDockerBackupRestore(t *testing.T) {
 	assertSchema := func(t *testing.T) {
 		t.Helper()
 		for query, want := range map[string]string{
-			"SELECT HEX(payload) FROM app.backup_probe WHERE id = 1": "0001FF275C0A",
-			"SELECT value FROM app.probe_view WHERE id = 1":          "original",
-			"CALL app.probe_value()":                                 "original",
+			"SELECT GROUP_CONCAT(v ORDER BY v) FROM app.history_probe FOR SYSTEM_TIME ALL":                           "1,2",
+			"SELECT HEX(payload) FROM app.backup_probe WHERE id = 1":                                                 "0001FF275C0A",
+			"SELECT value FROM app.probe_view WHERE id = 1":                                                          "original",
+			"CALL app.probe_value()":                                                                                 "original",
 			"SELECT STATUS FROM information_schema.EVENTS WHERE EVENT_SCHEMA = 'app' AND EVENT_NAME = 'probe_event'": "DISABLED",
 		} {
 			if got := sql(t, query); got != want {
@@ -119,11 +124,11 @@ func TestDockerBackupRestore(t *testing.T) {
 	}
 	baseEnv := map[string]string{
 		"MARIADB_HOST": "127.0.0.1", "MARIADB_USER": "root", "MARIADB_PASSWORD": "integration-password",
-		"MARIADB_DATABASE": "app", "S3_BUCKET": bucket, "S3_REGION": "us-east-1", "S3_ENDPOINT": "http://127.0.0.1:9000",
+		"MARIADB_DATABASE": "app", "S3_ALLOW_HTTP": "true", "S3_BUCKET": bucket, "S3_REGION": "us-east-1", "S3_ENDPOINT": "http://127.0.0.1:9000",
 		"S3_ACCESS_KEY_ID": "integration", "S3_SECRET_ACCESS_KEY": "integration-password",
 	}
 	runNumber := 0
-	runBackupImage := func(t *testing.T, overrides map[string]string, command ...string) {
+	runImage := func(t *testing.T, overrides map[string]string, command ...string) (string, error) {
 		t.Helper()
 		runNumber++
 		container := fmt.Sprintf("%s-run-%d", name, runNumber)
@@ -146,7 +151,16 @@ func TestDockerBackupRestore(t *testing.T) {
 		}
 		args = append(args, image)
 		args = append(args, command...)
-		t.Log(strings.TrimSpace(docker(t, ctx, args...)))
+		out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	runBackupImage := func(t *testing.T, overrides map[string]string, command ...string) {
+		t.Helper()
+		out, err := runImage(t, overrides, command...)
+		if err != nil {
+			t.Fatalf("backup container failed: %v\n%s", err, out)
+		}
+		t.Log(out)
 	}
 	listKeys := func(t *testing.T, prefix string) []string {
 		t.Helper()
@@ -354,6 +368,166 @@ func TestDockerBackupRestore(t *testing.T) {
 		runBackupImage(t, env, "mariadb-backup-s3", "restore")
 		if got := sql(t, checksumQuery); got != want {
 			t.Fatalf("streaming round trip changed data: got %q, want %q", got, want)
+		}
+	})
+	t.Run("restricted_privileges_and_case_sensitive_names", func(t *testing.T) {
+		sql(t, `CREATE DATABASE Sys;
+			CREATE TABLE Sys.Orders(id INT); CREATE TABLE Sys.orders(id INT);
+			CREATE TRIGGER Sys.record_insert BEFORE INSERT ON Sys.orders FOR EACH ROW SET NEW.id=10;
+			CREATE USER 'backup_test'@'%' IDENTIFIED BY 'limited';
+			GRANT SELECT, SHOW VIEW, EVENT ON Sys.* TO 'backup_test'@'%';
+			GRANT SELECT ON mysql.proc TO 'backup_test'@'%';`)
+		env := map[string]string{"MARIADB_USER": "backup_test", "MARIADB_PASSWORD": "limited",
+			"MARIADB_DATABASE": "", "MARIADB_BACKUP_ALL": "true", "S3_PREFIX": "case-test"}
+		checkFailure := func(want string) {
+			t.Helper()
+			out, err := runImage(t, env, "mariadb-backup-s3", "backup")
+			if err == nil || !strings.Contains(out, want) || len(listKeys(t, "case-test/Sys/")) != 0 {
+				t.Fatalf("expected %q before publication; err=%v output=%s", want, err, out)
+			}
+		}
+		checkFailure("TRIGGER")
+		sql(t, `CREATE ROLE backup_trigger;
+			CREATE ROLE backup_reader;
+			GRANT TRIGGER ON Sys.orders TO backup_trigger;
+			GRANT backup_trigger TO backup_reader;
+			GRANT backup_reader TO 'backup_test'@'%';`)
+		checkFailure("TRIGGER")
+		sql(t, "SET DEFAULT ROLE backup_reader FOR 'backup_test'@'%'")
+		checkFailure("Sys.Orders")
+		// Across the role hierarchy, a specific schema grant shadows a broader
+		// wildcard. Both grant rows must participate in the preflight.
+		sql(t, "GRANT SELECT ON Sys.* TO backup_reader; GRANT TRIGGER ON `S%`.* TO backup_trigger")
+		checkFailure("Sys.Orders")
+		sql(t, "GRANT TRIGGER ON Sys.Orders TO PUBLIC")
+		for _, opt := range []string{"--ignore-table=", "--ignore-table-data="} {
+			env["MARIADB_DUMP_EXTRA_OPTS"] = opt + "Sys.orders"
+			checkFailure("ambiguous exclusion")
+		}
+		delete(env, "MARIADB_DUMP_EXTRA_OPTS")
+		runBackupImage(t, env, "mariadb-backup-s3", "backup")
+		keys := listKeys(t, "case-test/Sys/")
+		if len(keys) != 1 {
+			t.Fatal("discovery omitted the accessible Sys database")
+		}
+		if !strings.Contains(readDump(t, keys[0]), "record_insert") {
+			t.Fatal("published dump is missing trigger record_insert")
+		}
+	})
+	t.Run("case_insensitive_database_selectors", func(t *testing.T) {
+		instance := name + "-fold"
+		t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", instance) })
+		docker(t, ctx, "run", "-d", "--name", instance, "--network", "container:"+mariadb,
+			"-e", "MARIADB_ROOT_PASSWORD=integration-password", "-e", "MARIADB_DATABASE=SalesData",
+			envOr("MARIADB_TEST_IMAGE", "mariadb:11.4"), "--port=3307", "--lower-case-table-names=1")
+		waitFor(t, ctx, "case-insensitive MariaDB", func(ctx context.Context) error {
+			return exec.CommandContext(ctx, "docker", "exec", instance, "mariadb", "--protocol=tcp", "-h127.0.0.1", "-P3307", "-uroot", "-pintegration-password", "-e", "SELECT 1").Run()
+		})
+		docker(t, ctx, "exec", instance, "mariadb", "--protocol=tcp", "-h127.0.0.1", "-P3307", "-uroot", "-pintegration-password", "-e", "CREATE DATABASE keepdb")
+		env := map[string]string{"MARIADB_PORT": "3307", "MARIADB_DATABASE": "", "MARIADB_BACKUP_ALL": "true", "MARIADB_DATABASES_EXCLUDE": "SalesData", "S3_PREFIX": "fold-discovery", "BACKUP_FILENAME_MODE": "fixed"}
+		runBackupImage(t, env, "mariadb-backup-s3", "backup")
+		keys := listKeys(t, "fold-discovery/")
+		if !slices.Contains(keys, "fold-discovery/keepdb_latest.sql") || slices.Contains(keys, "fold-discovery/salesdata_latest.sql") {
+			t.Fatalf("mixed-case exclusion: %v", keys)
+		}
+		env["S3_PREFIX"] = "fold"
+		delete(env, "MARIADB_DATABASES_EXCLUDE")
+		env["MARIADB_BACKUP_ALL"] = "false"
+		env["MARIADB_DATABASES"] = "SalesData,salesdata"
+		runBackupImage(t, env, "mariadb-backup-s3", "backup")
+		if keys := listKeys(t, "fold/"); strings.Join(keys, ",") != "fold/SalesData_latest.sql" {
+			t.Fatalf("duplicate selector keys: %v", keys)
+		}
+	})
+	t.Run("visibility_warnings_and_direct_schema_priority", func(t *testing.T) {
+		sql(t, "CREATE DATABASE visibility; CREATE TABLE visibility.exposed(id INT); CREATE TABLE visibility.hidden(id INT); CREATE PROCEDURE visibility.hidden_proc() SELECT 1; CREATE USER 'visibility_test'@'%' IDENTIFIED BY 'limited'; GRANT EVENT ON visibility.* TO 'visibility_test'@'%'; GRANT SELECT, TRIGGER ON visibility.exposed TO 'visibility_test'@'%'")
+		env := map[string]string{"MARIADB_DATABASE": "visibility", "MARIADB_USER": "visibility_test", "MARIADB_PASSWORD": "limited", "BACKUP_FILENAME_MODE": "fixed", "S3_PREFIX": "visibility"}
+		out, err := runImage(t, env, "mariadb-backup-s3", "backup")
+		if err != nil || !strings.Contains(out, "schema-wide SELECT") || !strings.Contains(out, "routine definitions") {
+			t.Fatalf("missing visibility warnings: %v %s", err, out)
+		}
+		key := "visibility/visibility_latest.sql"
+		if dump := readDump(t, key); !strings.Contains(dump, "exposed") || strings.Contains(dump, "hidden") {
+			t.Fatal("restricted dump differs from account visibility")
+		}
+		sql(t, "GRANT SELECT, TRIGGER, SHOW VIEW, SHOW CREATE ROUTINE ON visibility.* TO 'visibility_test'@'%'; GRANT SELECT ON `visib%`.* TO 'visibility_test'@'%'")
+		out, err = runImage(t, env, "mariadb-backup-s3", "backup")
+		if err != nil || strings.Contains(out, "cannot verify") {
+			t.Fatalf("complete access: %v %s", err, out)
+		}
+		if dump := readDump(t, key); !strings.Contains(dump, "`hidden`") || !strings.Contains(dump, "hidden_proc") {
+			t.Fatal("complete backup lacks table or routine")
+		}
+		// Reversing the specific and wildcard grants must not grant TRIGGER.
+		sql(t, "REVOKE TRIGGER ON visibility.* FROM 'visibility_test'@'%'; GRANT TRIGGER ON `visib%`.* TO 'visibility_test'@'%'")
+		if out, err := runImage(t, env, "mariadb-backup-s3", "backup"); err == nil || !strings.Contains(out, "TRIGGER") {
+			t.Fatalf("wildcard shadowed by direct grant: %v %s", err, out)
+		}
+	})
+	t.Run("restore_session_owns_lock_and_redacts_errors", func(t *testing.T) {
+		idle := sql(t, "SELECT @@GLOBAL.wait_timeout")
+		defer sql(t, "SET GLOBAL wait_timeout="+idle)
+		sql(t, "SET GLOBAL wait_timeout=1; CREATE TABLE app.import_owner(owns_lock INT)")
+		env := map[string]string{"S3_PREFIX": "import-lock", "BACKUP_FILENAME_MODE": "fixed"}
+		put := func(body string) {
+			_, err := client.PutObject(ctx, &s3.PutObjectInput{Bucket: &bucket, Key: aws.String("import-lock/app_latest.sql"), Body: strings.NewReader(body)})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		put("DO SLEEP(2); INSERT INTO app.import_owner SELECT IFNULL(IS_USED_LOCK('mariadb-backup-s3')=CONNECTION_ID(),0);")
+		runBackupImage(t, env, "mariadb-backup-s3", "restore")
+		if got := sql(t, "SELECT owns_lock FROM app.import_owner"); got != "1" {
+			t.Fatalf("import executed without owning the lock: %s", got)
+		}
+		put("CREATE TEMPORARY TABLE duplicate_key (v VARCHAR(40) PRIMARY KEY);\nINSERT INTO duplicate_key VALUES ('private-record'),('private-record');")
+		out, err := runImage(t, env, "mariadb-backup-s3", "restore")
+		if err == nil || !strings.Contains(out, "ERROR 1062 (23000) at line 2") || strings.Contains(out, "private-record") {
+			t.Fatalf("unexpected restore diagnostic: %v %s", err, out)
+		}
+		env["RESTORE_LOG_ERROR_DETAILS"] = "true"
+		out, err = runImage(t, env, "mariadb-backup-s3", "restore")
+		if err == nil || !strings.Contains(out, "private-record") {
+			t.Fatalf("explicit detailed diagnostics: %v %s", err, out)
+		}
+	})
+	t.Run("oversized_blob_preserves_destination", func(t *testing.T) {
+		packet := sql(t, "SELECT @@GLOBAL.max_allowed_packet")
+		defer sql(t, "SET GLOBAL max_allowed_packet="+packet)
+		sql(t, "SET GLOBAL max_allowed_packet=1048576; CREATE DATABASE packet_test; CREATE TABLE packet_test.big(v LONGBLOB); INSERT INTO packet_test.big VALUES(REPEAT('x',700000))")
+		env := map[string]string{"MARIADB_DATABASE": "packet_test", "BACKUP_FILENAME_MODE": "fixed", "S3_PREFIX": "packet"}
+		runBackupImage(t, env, "mariadb-backup-s3", "backup")
+		out, err := runImage(t, env, "mariadb-backup-s3", "restore")
+		if err == nil || !strings.Contains(out, "max_allowed_packet") {
+			t.Fatalf("packet preflight: %v %s", err, out)
+		}
+		if got := sql(t, "SELECT LENGTH(v) FROM packet_test.big"); got != "700000" {
+			t.Fatalf("failed preflight changed existing table: %q", got)
+		}
+		sql(t, "SET GLOBAL max_allowed_packet=2097152; TRUNCATE packet_test.big")
+		runBackupImage(t, env, "mariadb-backup-s3", "restore")
+		if got := sql(t, "SELECT LENGTH(v) FROM packet_test.big"); got != "700000" {
+			t.Fatalf("restore with sufficient packet size: %q", got)
+		}
+	})
+	t.Run("schema_grant_wildcards_match_bytes", func(t *testing.T) {
+		sql(t, `CREATE DATABASE aé1;
+			CREATE TABLE aé1.items(id INT);
+			CREATE TRIGGER aé1.set_id BEFORE INSERT ON aé1.items FOR EACH ROW SET NEW.id=1;
+			CREATE USER 'wildcard_test'@'%' IDENTIFIED BY 'limited';
+			GRANT SELECT, SHOW VIEW, EVENT ON *.* TO 'wildcard_test'@'%';
+			GRANT TRIGGER ON a_1.* TO 'wildcard_test'@'%';`)
+		env := map[string]string{"MARIADB_USER": "wildcard_test", "MARIADB_PASSWORD": "limited",
+			"MARIADB_DATABASE": "aé1", "S3_PREFIX": "wildcard-test"}
+		out, err := runImage(t, env, "mariadb-backup-s3", "backup")
+		if err == nil || !strings.Contains(out, "TRIGGER") || len(listKeys(t, "wildcard-test/")) != 0 {
+			t.Fatalf("single underscore covered a two-byte identifier: err=%v output=%s", err, out)
+		}
+		sql(t, "GRANT TRIGGER ON a__1.* TO 'wildcard_test'@'%'")
+		runBackupImage(t, env, "mariadb-backup-s3", "backup")
+		keys := listKeys(t, "wildcard-test/")
+		if len(keys) != 1 || !strings.Contains(readDump(t, keys[0]), "set_id") {
+			t.Fatal("backup with matching two-byte grant did not publish the trigger")
 		}
 	})
 }

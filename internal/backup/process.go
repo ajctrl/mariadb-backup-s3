@@ -7,16 +7,22 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ajctrl/mariadb-backup-s3/internal/tempfile"
 )
 
 type commandRunner struct {
-	defaultsFile   string
-	passphraseFile string
-	stderr         io.Writer
-	lock           *os.File
+	defaults          string
+	passphrase        string
+	stderr            io.Writer
+	lock              *os.File
+	lease             *os.File
+	foldDatabaseNames bool
+	importSQL         func(*os.File) error
 }
 
 func (r commandRunner) run(ctx context.Context, stdout io.Writer, name string, args ...string) error {
@@ -35,28 +41,32 @@ func (r commandRunner) runInput(ctx context.Context, stdin io.Reader, stdout io.
 }
 
 func (r commandRunner) command(ctx context.Context, name string, args ...string) (*exec.Cmd, func(), error) {
-	if name == "mariadb" || name == "mariadb-dump" {
-		args = append([]string{"--defaults-file=" + r.defaultsFile}, args...)
-	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stderr = r.stderr
 	cmd.Env = withoutEnv(withoutEnv(withoutEnv(os.Environ(), "MYSQL_PWD"), "MARIADB_PASSWORD"), "PASSPHRASE")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if r.lock != nil {
-		// The dump/encryption child keeps the lock if the parent is killed abruptly.
 		cmd.ExtraFiles = []*os.File{r.lock}
 	}
 	closeFiles := func() {}
-	if name == "gpg" {
-		// Each invocation gets an independent offset, including repeated DB dumps.
-		file, err := os.Open(r.passphraseFile)
-		if err != nil {
-			return nil, nil, fmt.Errorf("open GPG passphrase file: %w", err)
-		}
+	if name == "mariadb" || name == "mariadb-dump" || name == "gpg" {
 		fd := 3 + len(cmd.ExtraFiles)
-		cmd.ExtraFiles = append(cmd.ExtraFiles, file)
-		cmd.Args = append([]string{cmd.Args[0], "--passphrase-fd", fmt.Sprint(fd)}, args...)
-		closeFiles = func() { file.Close() }
+		secret := r.defaults
+		options := []string{fmt.Sprintf("--defaults-file=/proc/self/fd/%d", fd)}
+		if name == "gpg" {
+			secret = r.passphrase
+			options = []string{"--passphrase-fd", fmt.Sprint(fd)}
+		}
+		f, err := anonymousCredential(secret)
+		if err != nil {
+			return nil, nil, err
+		}
+		cmd.ExtraFiles = append(cmd.ExtraFiles, f)
+		cmd.Args = append(append([]string{cmd.Args[0]}, options...), args...)
+		closeFiles = func() { f.Close() }
+	}
+	if r.lease != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, r.lease)
 	}
 	cmd.Cancel = func() error {
 		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -67,6 +77,23 @@ func (r commandRunner) command(ctx context.Context, name string, args ...string)
 	}
 	cmd.WaitDelay = 5 * time.Second
 	return cmd, closeFiles, nil
+}
+
+// Unlink before writing a secret. Each child receives a separate file offset.
+func anonymousCredential(value string) (*os.File, error) {
+	f, err := tempfile.Open("/tmp", "mariadb-credential-*")
+	if err != nil {
+		return nil, err
+	}
+	_, err = io.WriteString(f, value)
+	if err == nil {
+		_, err = f.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func commandError(ctx context.Context, name string, err error) error {
@@ -169,9 +196,25 @@ func withoutEnv(environ []string, name string) []string {
 }
 
 func acquireLock(path string) (*os.File, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	dir := filepath.Dir(path)
+	if err := os.Mkdir(dir, 0700); err != nil && !os.IsExist(err) {
+		return nil, err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode().Perm()&0077 != 0 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("unsafe backup lock directory %q", dir)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("open backup lock: %w", err)
+	}
+	info, err = file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		file.Close()
+		return nil, fmt.Errorf("unsafe backup lock %q", path)
 	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()

@@ -15,7 +15,7 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 			}
 			value, ok := base[key]
 			return value, ok
-		})
+		}, "backup")
 	}
 	c, err := load(nil)
 	if err != nil || c.Prefix != "backup" || c.Port != "3306" || c.BackupMode != "per-database" || c.FilenameMode != "timestamp" || c.Storage.Region != "us-west-1" {
@@ -136,7 +136,7 @@ func TestScheduleCompatibility(t *testing.T) {
 			t.Errorf("invalid schedule %q: %v", spec, err)
 		}
 	}
-	for _, spec := range []string{"", "garbage", "* *", "61 * * * * *", "CRON_TZ=Asia/Tokyo", "TZ=UTC\t"} {
+	for _, spec := range []string{"", "garbage", "* *", "@every -2h", "@every 0s", "CRON_TZ=Asia/Tokyo @every 500ms", "61 * * * * *", "CRON_TZ=Asia/Tokyo", "TZ=UTC\t"} {
 		if _, err := parseSchedule(spec); err == nil {
 			t.Errorf("accepted invalid schedule %q", spec)
 		}
@@ -147,7 +147,7 @@ func TestUploadPartSizeConfiguration(t *testing.T) {
 	for _, value := range []string{"", "5", "8", "64", "5120", "4", "5121", "-1", "1.5", "huge"} {
 		t.Run(value, func(t *testing.T) {
 			env := map[string]string{"S3_BUCKET": "bucket", "MARIADB_USER": "user", "MARIADB_PASSWORD": "secret", "MARIADB_HOST": "db", "S3_UPLOAD_PART_SIZE_MB": value}
-			c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+			c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok }, "backup")
 			valid := value == "" || value == "5" || value == "8" || value == "64" || value == "5120"
 			if (err == nil) != valid {
 				t.Fatalf("part size %q: %v", value, err)

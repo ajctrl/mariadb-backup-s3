@@ -5,31 +5,36 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/ajctrl/mariadb-backup-s3/internal/tempfile"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
-	transfertypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 type Object struct {
 	Key          string
 	LastModified time.Time
+	ETag         string
 }
 
 type Store interface {
+	ManagesRetention() bool
 	VersioningEnabled(context.Context) (bool, error)
-	Upload(ctx context.Context, key string, body io.ReadCloser) error
-	Download(ctx context.Context, key, versionID, path string) error
-	List(ctx context.Context, prefix string) ([]Object, error)
-	Delete(ctx context.Context, key string) error
+	Upload(ctx context.Context, key string, body io.ReadCloser, createOnly bool) error
+	Download(ctx context.Context, key, versionID string) (*os.File, error)
+	List(ctx context.Context, prefix string, visit func(Object, time.Time) error) error
+	Delete(ctx context.Context, objects []Object) error
 }
 
 type Config struct {
@@ -40,6 +45,8 @@ type Config struct {
 	SecretAccessKey     string
 	SessionToken        string
 	UploadPartSizeBytes int64
+	AllowHTTP           bool
+	DiskUpload          bool
 }
 
 type S3 struct {
@@ -47,6 +54,7 @@ type S3 struct {
 	client         *s3.Client
 	transfer       *transfermanager.Client
 	uploadPartSize int64
+	diskUpload     bool
 }
 
 var _ Store = (*S3)(nil)
@@ -71,10 +79,13 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 	if cfg.UploadPartSizeBytes < 5*1024*1024 || cfg.UploadPartSizeBytes > 5*1024*1024*1024 {
 		return nil, fmt.Errorf("S3 upload part size must be between 5 MiB and 5 GiB")
 	}
+	if !cfg.DiskUpload && cfg.UploadPartSizeBytes > 64<<20 {
+		return nil, fmt.Errorf("part sizes over 64 MiB require S3_UPLOAD_BUFFER=disk")
+	}
 	if cfg.Endpoint != "" {
 		u, err := url.Parse(cfg.Endpoint)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return nil, fmt.Errorf("S3_ENDPOINT must be an HTTP or HTTPS URL without credentials, query, or fragment")
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || (u.Scheme == "http" && !cfg.AllowHTTP) || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("S3_ENDPOINT requires HTTPS (HTTP requires S3_ALLOW_HTTP=true) and a host without credentials, query, or fragment")
 		}
 	}
 	options := []func(*config.LoadOptions) error{}
@@ -101,7 +112,7 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 		awsConfig.Region = "us-west-1"
 	}
 	client := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
-		o.HTTPClient = withIdleTimeout(o.HTTPClient, idleTimeout)
+		o.HTTPClient = withIdleTimeout(o.HTTPClient, idleTimeout, cfg.AllowHTTP)
 		if cfg.Endpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 			// S3-compatible endpoints often lack wildcard DNS/certificates.
@@ -109,16 +120,16 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 		}
 	})
 	transfer := transfermanager.New(client, func(o *transfermanager.Options) {
-		// Range downloads work with AWS and compatible stores, including objects
-		// originally uploaded without multipart metadata.
-		o.GetObjectType = transfertypes.GetObjectRanges
 		// Failed/canceled uploads must still be able to abort uploaded parts.
 		o.FailTimeout = 10 * time.Second
 		// Respect AWS_REQUEST_CHECKSUM_CALCULATION and profile configuration.
 		o.RequestChecksumCalculation = awsConfig.RequestChecksumCalculation
 	})
-	return &S3{bucket: cfg.Bucket, client: client, transfer: transfer, uploadPartSize: cfg.UploadPartSizeBytes}, nil
+	return &S3{bucket: cfg.Bucket, client: client, transfer: transfer, uploadPartSize: cfg.UploadPartSizeBytes, diskUpload: cfg.DiskUpload}, nil
 }
+
+// The resolved SDK option also covers endpoints supplied by AWS profiles and environment.
+func (s *S3) ManagesRetention() bool { return s.client.Options().BaseEndpoint == nil }
 
 func (s *S3) VersioningEnabled(ctx context.Context) (bool, error) {
 	out, err := s.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(s.bucket)})
@@ -128,78 +139,115 @@ func (s *S3) VersioningEnabled(ctx context.Context) (bool, error) {
 	return out.Status == types.BucketVersioningStatusEnabled, nil
 }
 
-func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
+func (s *S3) Download(ctx context.Context, key, versionID string) (*os.File, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".s3-download-*")
-	if err != nil {
-		return fmt.Errorf("create download file: %w", err)
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	input := &transfermanager.DownloadObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(key), WriterAt: f,
-	}
+	input := &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), ChecksumMode: types.ChecksumModeEnabled}
 	if versionID != "" {
-		input.VersionID = aws.String(versionID)
+		input.VersionId = aws.String(versionID)
 	}
-	download, err := s.transfer.DownloadObject(ctx, input)
+	// One full GET reads one generation, including mutable null versions.
+	obj, err := s.client.GetObject(ctx, input)
 	if err != nil {
-		return fmt.Errorf("download S3 object %q: %w", key, err)
+		return nil, fmt.Errorf("download S3 object %q: %w", key, err)
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	defer obj.Body.Close()
+	if versionID != "" && aws.ToString(obj.VersionId) != versionID {
+		return nil, fmt.Errorf("download S3 object %q: response did not confirm the requested version", key)
 	}
-	// The transfer manager can report an unsatisfiable range as a successful empty download.
-	if aws.ToInt64(download.ContentLength) == 0 {
-		return fmt.Errorf("download S3 object %q: no backup data received", key)
+	resp, _ := middleware.GetRawResponse(obj.ResultMetadata).(*smithyhttp.Response)
+	if resp == nil || resp.StatusCode != http.StatusOK || obj.ContentRange != nil || aws.ToInt64(obj.ContentLength) <= 0 {
+		return nil, fmt.Errorf("download S3 object %q: expected a nonempty full object with Content-Length", key)
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close download file: %w", err)
+	f, err := tempfile.Open("", "mariadb-download-*")
+	if err != nil {
+		return nil, err
 	}
-	// Never expose an incomplete download to the restore client, including on retries.
-	if err := os.Rename(f.Name(), path); err != nil {
-		return fmt.Errorf("finish download file: %w", err)
+	n, err := io.Copy(f, obj.Body)
+	if err == nil && n != *obj.ContentLength {
+		err = fmt.Errorf("received %d of %d bytes", n, *obj.ContentLength)
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		_, err = f.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("read S3 object %q: %w", key, err)
+	}
+	return f, nil
+}
+
+func (s *S3) List(ctx context.Context, prefix string, visit func(Object, time.Time) error) error {
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), Delimiter: aws.String("/")})
+	tokens := make(map[string]bool)
+	var serverTime time.Time
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("list S3 objects: %w", err)
+		}
+		if serverTime.IsZero() {
+			serverTime, _ = middleware.GetServerTime(page.ResultMetadata)
+		}
+		if page.IsTruncated == nil || (!*page.IsTruncated && aws.ToString(page.NextContinuationToken) != "") {
+			return fmt.Errorf("S3 list response has an inconsistent page boundary")
+		}
+		if *page.IsTruncated {
+			token := aws.ToString(page.NextContinuationToken)
+			if token == "" || tokens[token] {
+				return fmt.Errorf("S3 list response contains an invalid continuation token")
+			}
+			tokens[token] = true
+		}
+		for _, obj := range page.Contents {
+			if obj.Key == nil || obj.LastModified == nil {
+				return fmt.Errorf("S3 list response contains an object without a key or modification time")
+			}
+			if err := visit(Object{Key: *obj.Key, LastModified: *obj.LastModified, ETag: strings.Trim(aws.ToString(obj.ETag), `"`)}, serverTime); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
-func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
-	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
-	})
-	var objects []Object
-	tokens := make(map[string]bool)
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list S3 objects: %w", err)
+func (s *S3) Delete(ctx context.Context, objects []Object) error {
+	ids := make([]types.ObjectIdentifier, 0, len(objects))
+	for _, obj := range objects {
+		etag := strings.Trim(obj.ETag, `"`)
+		if etag == "" || etag == "*" {
+			return fmt.Errorf("missing specific ETag for %q", obj.Key)
 		}
-		for _, object := range page.Contents {
-			// Missing dates must not turn an unknown age into an expired backup.
-			if object.Key == nil || object.LastModified == nil {
-				return nil, fmt.Errorf("S3 list response contains an object without a key or modification time")
-			}
-			objects = append(objects, Object{Key: *object.Key, LastModified: *object.LastModified})
-		}
-		if aws.ToBool(page.IsTruncated) {
-			token := aws.ToString(page.NextContinuationToken)
-			if token == "" || tokens[token] {
-				return nil, fmt.Errorf("S3 list response contains an invalid continuation token")
-			}
-			tokens[token] = true
-		}
+		ids = append(ids, types.ObjectIdentifier{Key: aws.String(obj.Key), ETag: aws.String(etag)})
 	}
-	return objects, nil
-}
-
-func (s *S3) Delete(ctx context.Context, key string) error {
-	// Deliberately delete the current key only. Noncurrent versions remain
-	// governed by the bucket lifecycle, matching the previous aws s3 rm command.
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: aws.String(s.bucket), Delete: &types.Delete{Objects: ids}}, func(o *s3.Options) {
+		// General-purpose buckets require Content-MD5 for the serialized XML.
+		o.APIOptions = append(o.APIOptions, smithyhttp.AddContentChecksumMiddleware)
+	})
 	if err != nil {
-		return fmt.Errorf("delete S3 object %q: %w", key, err)
+		return fmt.Errorf("delete expired objects: %w", err)
+	}
+	if len(out.Errors) > 0 {
+		e := out.Errors[0]
+		return fmt.Errorf("delete %q: %s: %s", aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
+	}
+	pending := make(map[string]int, len(objects))
+	for _, obj := range objects {
+		pending[obj.Key]++
+	}
+	for _, obj := range out.Deleted {
+		key := aws.ToString(obj.Key)
+		if pending[key] == 0 {
+			return fmt.Errorf("S3 confirmed an unexpected deletion: %q", key)
+		}
+		pending[key]--
+	}
+	if len(out.Deleted) != len(objects) {
+		return fmt.Errorf("S3 confirmed %d of %d deletions", len(out.Deleted), len(objects))
 	}
 	return nil
 }
