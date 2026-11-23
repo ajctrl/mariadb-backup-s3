@@ -87,59 +87,72 @@ type pipelineCommand struct {
 
 // pipeline waits for every process, including a producer that closes stdout
 // before reporting an error. Only its caller may signal EOF to the uploader.
-func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...pipelineCommand) error {
+func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, producer pipelineCommand, filter *pipelineCommand) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmds := make([]*exec.Cmd, len(specs))
-	var pipes []*os.File
-	closePipes := func() {
-		for _, pipe := range pipes {
-			pipe.Close()
-		}
-		pipes = nil
+	dump, closeDumpFiles, err := r.command(ctx, producer.name, producer.args...)
+	if err != nil {
+		return err
 	}
-	defer closePipes()
-	for i, spec := range specs {
-		cmd, closeFiles, err := r.command(ctx, spec.name, spec.args...)
+	defer closeDumpFiles()
+	// Own the read end so we can observe EOF even if the dump process keeps running.
+	source, dumpOut, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	defer dumpOut.Close()
+	dump.Stdout = dumpOut
+
+	destination := stdout
+	var filterInput io.WriteCloser
+	done := make(chan error, 3)
+	pending := 2 // dump process and plaintext copy
+	if filter != nil {
+		cmd, closeFiles, err := r.command(ctx, filter.name, filter.args...)
 		if err != nil {
 			return err
 		}
 		defer closeFiles()
-		cmds[i] = cmd
-		// A slow upload may still be draining stdout after the child exits.
-		// Cancellation closes the upload pipe; do not truncate it after WaitDelay.
-		cmds[i].WaitDelay = 0
-		if i > 0 {
-			reader, writer, err := os.Pipe()
-			if err != nil {
-				return err
-			}
-			pipes = append(pipes, reader, writer)
-			cmds[i-1].Stdout, cmds[i].Stdin = writer, reader
+		cmd.Stdout = stdout
+		// A slow upload can still be draining after GPG exits.
+		cmd.WaitDelay = 0
+		filterInput, err = cmd.StdinPipe()
+		if err != nil {
+			return err
 		}
+		if err := cmd.Start(); err != nil {
+			return commandError(ctx, filter.name, err)
+		}
+		destination = filterInput
+		pending++
+		go func() { done <- commandError(ctx, filter.name, cmd.Wait()) }()
 	}
-	cmds[len(cmds)-1].Stdout = stdout
-	var started []int
+
+	err = dump.Start()
+	dumpOut.Close() // Only the child may keep the write end open.
+	if err != nil {
+		done <- commandError(ctx, producer.name, err)
+	} else {
+		go func() { done <- commandError(ctx, producer.name, dump.Wait()) }()
+	}
+	go func() {
+		n, err := io.Copy(destination, source)
+		if filterInput != nil {
+			filterInput.Close()
+		}
+		if err == nil && n == 0 {
+			err = errors.New("no backup data to upload")
+		}
+		done <- err
+	}()
+
 	var result error
-	// Start consumers first; OS pipes give backpressure without buffering dumps.
-	for i := len(cmds) - 1; i >= 0; i-- {
-		if err := cmds[i].Start(); err != nil {
-			result = commandError(ctx, specs[i].name, err)
-			cancel()
-			break
-		}
-		started = append(started, i)
-	}
-	// Only children retain these descriptors, so early exits propagate EOF/EPIPE.
-	closePipes()
-	done := make(chan error, len(started))
-	for _, i := range started {
-		go func() { done <- commandError(ctx, specs[i].name, cmds[i].Wait()) }()
-	}
-	for range started {
+	for range pending {
 		if err := <-done; err != nil {
 			result = errors.Join(result, err)
 			cancel()
+			source.Close()
 		}
 	}
 	return result

@@ -112,6 +112,9 @@ case "$command" in
     fi
     ;;
   mariadb-dump)
+    if [ -n "${FAKE_EMPTY_DUMP:-}" ] && [ "$database" = "$FAKE_EMPTY_DUMP" ]; then
+      exit 0
+    fi
     if [ "$database" = "${FAKE_DUMP_FAILURE:-}" ]; then
       printf 'partial dump\n'
       exit 1
@@ -762,7 +765,7 @@ func TestTimestampIgnoresOverwriteOverride(t *testing.T) {
 
 func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
 	for _, mode := range []string{"timestamp", "fixed"} {
-		for _, stage := range []string{"dump", "encrypt", "upload"} {
+		for _, stage := range []string{"dump", "empty", "empty-encrypted", "encrypt", "upload"} {
 			t.Run(mode+"/"+stage, func(t *testing.T) {
 				f := newFixture(t)
 				f.env["MARIADB_DATABASES"], f.env["BACKUP_FILENAME_MODE"] = "app,billing", mode
@@ -770,12 +773,20 @@ func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
 				switch stage {
 				case "dump":
 					f.env["FAKE_DUMP_FAILURE"] = "app"
+				case "empty":
+					f.env["PASSPHRASE"] = ""
+					fallthrough
+				case "empty-encrypted":
+					f.env["FAKE_EMPTY_DUMP"] = "app"
 				case "encrypt":
 					f.env["FAKE_GPG_FAILURE"] = "app"
 				case "upload":
 					f.s3.uploadFailure = "app"
 				}
 				output := f.run(false, "backup")
+				if strings.HasPrefix(stage, "empty") && !strings.Contains(output, "no backup data to upload") {
+					t.Fatalf("missing empty backup error: %s", output)
+				}
 				if !strings.Contains(output, "1 succeeded, 1 failed") {
 					t.Fatalf("incorrect failure summary: %s", output)
 				}

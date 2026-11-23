@@ -144,11 +144,16 @@ func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
 	if versionID != "" {
 		input.VersionID = aws.String(versionID)
 	}
-	if _, err := s.transfer.DownloadObject(ctx, input); err != nil {
+	download, err := s.transfer.DownloadObject(ctx, input)
+	if err != nil {
 		return fmt.Errorf("download S3 object %q: %w", key, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// The transfer manager can report an unsatisfiable range as a successful empty download.
+	if aws.ToInt64(download.ContentLength) == 0 {
+		return fmt.Errorf("download S3 object %q: no backup data received", key)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close download file: %w", err)

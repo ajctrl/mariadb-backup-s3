@@ -15,7 +15,7 @@ func TestPipelineDrainsSlowOutputAfterProcessExit(t *testing.T) {
 	defer writer.Close()
 	done := make(chan error, 1)
 	go func() {
-		err := (commandRunner{stderr: io.Discard}).pipeline(ctx, writer, pipelineCommand{name: "sh", args: []string{"-c", "printf x"}})
+		err := (commandRunner{stderr: io.Discard}).pipeline(ctx, writer, pipelineCommand{name: "sh", args: []string{"-c", "printf x"}}, nil)
 		writer.CloseWithError(err)
 		done <- err
 	}()

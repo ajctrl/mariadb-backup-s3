@@ -313,21 +313,37 @@ func TestS3CanceledMultipartUploadIsAborted(t *testing.T) {
 }
 
 func TestS3FailedDownloadKeepsDestination(t *testing.T) {
-	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
-		writeS3Error(w, http.StatusNotFound, "NoSuchKey")
-	})
-	dir := t.TempDir()
-	path := filepath.Join(dir, "existing.dump")
-	if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Download(context.Background(), "missing.dump", "", path); err == nil {
-		t.Fatal("missing object download succeeded")
-	}
-	body, _ := os.ReadFile(path)
-	entries, _ := os.ReadDir(dir)
-	if string(body) != "existing" || len(entries) != 1 {
-		t.Fatalf("failed download changed destination or left temporary files: body = %q, entries = %v", body, entries)
+	for _, tc := range []struct {
+		name    string
+		respond http.HandlerFunc
+	}{
+		{"missing", func(w http.ResponseWriter, _ *http.Request) {
+			writeS3Error(w, http.StatusNotFound, "NoSuchKey")
+		}},
+		{"unsatisfiable range", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Range", "bytes */64")
+			writeS3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange")
+		}},
+		{"empty response", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testS3(t, tc.respond)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "existing.dump")
+			if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Download(t.Context(), "backup.dump", "", path); err == nil {
+				t.Fatal("invalid backup download succeeded")
+			}
+			body, _ := os.ReadFile(path)
+			entries, _ := os.ReadDir(dir)
+			if string(body) != "existing" || len(entries) != 1 {
+				t.Fatalf("failed download changed destination or left temporary files: body = %q, entries = %v", body, entries)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	transfertypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -47,6 +48,22 @@ func (s *S3) Upload(ctx context.Context, key string, body io.ReadCloser) error {
 type streamUploadClient struct {
 	*s3.Client
 	cancel context.CancelCauseFunc
+}
+
+func (c *streamUploadClient) PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	// The transfer manager buffers the whole body for a single PUT. Multipart
+	// uploads already have a full first part before they are initiated.
+	size, err := transfertypes.ReadSeekCloser(in.Body).GetLen()
+	if err != nil {
+		return nil, fmt.Errorf("measure buffered backup: %w", err)
+	}
+	if size < 0 {
+		return nil, errors.New("unknown buffered backup size")
+	}
+	if size == 0 {
+		return nil, errors.New("no backup data to upload")
+	}
+	return c.Client.PutObject(ctx, in, opts...)
 }
 
 func (c *streamUploadClient) UploadPart(ctx context.Context, in *s3.UploadPartInput, opts ...func(*s3.Options)) (*s3.UploadPartOutput, error) {

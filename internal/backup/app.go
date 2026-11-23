@@ -280,12 +280,13 @@ func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databas
 	}
 	args = append(args, "--")
 	args = append(args, databases...)
-	commands := []pipelineCommand{{name: "mariadb-dump", args: args}}
+	dump := pipelineCommand{name: "mariadb-dump", args: args}
+	var encrypt *pipelineCommand
 	if a.Config.Passphrase != "" {
 		fmt.Fprintf(a.Out, "Encrypting backup of %s...\n", label)
-		commands = append(commands, pipelineCommand{name: "gpg", args: []string{
+		encrypt = &pipelineCommand{name: "gpg", args: []string{
 			"--symmetric", "--batch", "--pinentry-mode", "loopback", "--output", "-",
-		}})
+		}}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -296,7 +297,7 @@ func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databas
 	defer stop()
 	done := make(chan error, 1)
 	go func() {
-		err := runner.pipeline(ctx, writer, commands...)
+		err := runner.pipeline(ctx, writer, dump, encrypt)
 		writer.CloseWithError(err)
 		done <- err
 	}()
