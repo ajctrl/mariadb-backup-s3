@@ -312,10 +312,8 @@ func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databas
 		args = append(args, "--single-transaction")
 	}
 	args = append(args, opts...)
-	if a.Config.BackupMode == "combined" {
-		args = append(args, "--databases")
-	}
-	args = append(args, "--")
+	// Native CREATE DATABASE records the source defaults for single-database restores too.
+	args = append(args, "--databases", "--")
 	args = append(args, databases...)
 	dump := pipelineCommand{name: "mariadb-dump", args: args}
 	var encrypt *pipelineCommand

@@ -21,9 +21,6 @@ func (a *App) withServerLock(ctx context.Context, r commandRunner, restore bool,
 	args := append(a.connectionArgs(), "--batch", "--unbuffered", "--skip-reconnect", "--skip-column-names", "--skip-print-query-on-error")
 	if restore {
 		args = append(args, "--binary-mode", "--max-allowed-packet=1G")
-		if a.Config.BackupMode != "combined" {
-			args = append(args, "--database="+a.Config.Database)
-		}
 	}
 	cmd, closeFiles, err := r.command(session, "mariadb", args...)
 	if err != nil {
@@ -95,6 +92,26 @@ func (a *App) withServerLock(ctx context.Context, r commandRunner, restore bool,
 			if err := checkPacketSize(job, file, min(packet, 1<<30), fields[3]); err != nil {
 				return err
 			}
+			var prefix string
+			if a.Config.BackupMode != "combined" {
+				existing, err := destinationDefaults(client.query, a.Config.Database)
+				if err != nil {
+					return err
+				}
+				prefix, err = a.prepareDatabase(job, file, existing, r.foldDatabaseNames, min(packet, 1<<30), fields[3], client.query)
+				if err != nil {
+					return err
+				}
+				if existing != nil {
+					current, err := destinationDefaults(client.query, a.Config.Database)
+					if err != nil {
+						return err
+					}
+					if current == nil || *current != *existing {
+						return errors.New("destination database changed during preflight; no SQL imported")
+					}
+				}
+			}
 			stopMonitor()
 			stopImport := context.AfterFunc(job, stop)
 			defer stopImport()
@@ -108,10 +125,10 @@ func (a *App) withServerLock(ctx context.Context, r commandRunner, restore bool,
 			// and block the client while Go is still writing the dump.
 			drained := make(chan error, 1)
 			go func() { _, err := io.Copy(io.Discard, reader); drained <- err }()
-			_, writeErr := io.Copy(feed, file)
+			_, writeErr := io.Copy(feed, io.MultiReader(strings.NewReader(prefix), file))
 			feed.Close()
 			<-exited
-			return errors.Join(writeErr, <-drained, commandError(job, "mariadb", clientErr), diagnostic.err(client.preambleLines))
+			return errors.Join(writeErr, <-drained, commandError(job, "mariadb", clientErr), diagnostic.err(client.preambleLines+strings.Count(prefix, "\n")))
 		}
 	} else {
 		r.lease = feed
@@ -125,12 +142,15 @@ func (a *App) withServerLock(ctx context.Context, r commandRunner, restore bool,
 }
 
 type lockClient struct {
+	mu            sync.Mutex // serialize metadata queries and heartbeat replies
 	feed, reply   *os.File
 	reader        *bufio.Reader
 	preambleLines int
 }
 
 func (c *lockClient) query(sql string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, err := io.WriteString(c.feed, sql+";\n"); err != nil {
 		return "", err
 	}

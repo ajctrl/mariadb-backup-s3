@@ -200,8 +200,17 @@ func TestDockerBackupRestore(t *testing.T) {
 		if dump := readDump(t, keys[0]); !strings.Contains(dump, "CREATE TABLE `backup_probe`") || !strings.Contains(dump, "0x0001FF275C0A") {
 			t.Fatal("backup did not contain table SQL and binary data")
 		}
-		sql(t, "DROP DATABASE app; CREATE DATABASE app")
+		sourceCollation := sql(t, "SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='app'")
+		sql(t, "DROP DATABASE app; CREATE DATABASE app CHARACTER SET latin1 COLLATE latin1_bin; CREATE TABLE app.keep_me(id INT); INSERT INTO app.keep_me VALUES(42)")
+		out, err := runImage(t, env, "sh", "restore.sh")
+		if err == nil || !strings.Contains(out, sourceCollation) || !strings.Contains(out, "latin1_bin") || sql(t, "SELECT id FROM app.keep_me") != "42" {
+			t.Fatalf("restore did not stop before changing the mismatched destination: %v\n%s", err, out)
+		}
+		sql(t, "DROP DATABASE app")
 		runBackupImage(t, env, "sh", "restore.sh")
+		if got := sql(t, "SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='app'"); got != sourceCollation {
+			t.Fatalf("created database collation = %q, want %q", got, sourceCollation)
+		}
 		assertValue(t, "original")
 		assertSchema(t)
 	}) {

@@ -22,6 +22,7 @@ services:
       mariadb:
         condition: service_healthy
     environment:
+      RESTORE_DATABASE_DEFAULTS: ${RESTORE_DATABASE_DEFAULTS:-}
       RESTORE_LOG_ERROR_DETAILS: "${RESTORE_LOG_ERROR_DETAILS:-false}"
       BACKUP_TIMEOUT: ${BACKUP_TIMEOUT:-24h}
       SCHEDULE: ${SCHEDULE:-}

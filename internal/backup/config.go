@@ -24,6 +24,7 @@ type Config struct {
 	Timeout                                              time.Duration
 	AllowUnversionedOverwrite                            bool
 	RestoreLogErrorDetails                               bool
+	RestoreDatabaseDefaults                              string
 	Storage                                              storage.Config
 }
 
@@ -84,6 +85,7 @@ func loadConfig(lookup func(string) (string, bool), command string) (Config, err
 		return c, fmt.Errorf("S3_ALLOW_HTTP must be true or false")
 	}
 	if command == "restore" {
+		c.RestoreDatabaseDefaults = get("RESTORE_DATABASE_DEFAULTS")
 		switch valueOr("RESTORE_LOG_ERROR_DETAILS", "false") {
 		case "true":
 			c.RestoreLogErrorDetails = true

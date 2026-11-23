@@ -61,6 +61,7 @@ for arg do
   while IFS= read -r query; do
     case "$query" in
       *"SELECT GET_LOCK("* ) printf '%s\t0\t%s\t\n' "${FAKE_LOCK_RESULT:-1}" "${FAKE_MAX_PACKET:-16777216}";;
+      "SELECT COALESCE((SELECT CONCAT(DEFAULT_CHARACTER_SET_NAME"* ) printf '%s\n' "${FAKE_DEST_DEFAULTS:-utf8mb4/utf8mb4_bin}";;
       "SELECT IS_USED_LOCK("* ) printf '%s\n' "${FAKE_LOCK_RESULT:-1}";;
       *) first_sql=$query; break;;
     esac
@@ -124,7 +125,8 @@ case "$command" in
       cat "$FAKE_DATABASES_FILE"
     else
       payload=$(printf '%s\n' "$first_sql"; cat)
-      case "$payload" in '-- SQL'*) ;; *) exit 3;; esac
+      case "$payload" in '-- SQL'*|'USE '*|'CREATE DATABASE '*) ;; *) exit 3;; esac
+      printf '%s\n' "$payload" | sed -n 's/^USE \x60\(.*\)\x60;$/selection\t\1/p' >> "$FAKE_LOG"
       [ -z "${FAKE_RESTORE_INPUT:-}" ] || printf '%s\n' "$payload" > "$FAKE_RESTORE_INPUT"
       [ "${FAKE_RESTORE_FAILURE:-}" != true ] || exit 1
     fi
@@ -393,7 +395,7 @@ func (f *fixture) command(args ...string) *exec.Cmd {
 	cmd.Dir = f.dir
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "MARIADB_") || strings.HasPrefix(key, "MYSQL_") || strings.HasPrefix(key, "S3_") || strings.HasPrefix(key, "AWS_") || strings.HasPrefix(key, "BACKUP_") || key == "PASSPHRASE" || key == "SCHEDULE" || key == "TMPDIR" || key == "PATH" {
+		if strings.HasPrefix(key, "MARIADB_") || strings.HasPrefix(key, "MYSQL_") || strings.HasPrefix(key, "S3_") || strings.HasPrefix(key, "AWS_") || strings.HasPrefix(key, "BACKUP_") || strings.HasPrefix(key, "RESTORE_") || key == "PASSPHRASE" || key == "SCHEDULE" || key == "TMPDIR" || key == "PATH" {
 			continue
 		}
 		cmd.Env = append(cmd.Env, entry)
@@ -452,16 +454,17 @@ func (f *fixture) processes(command string) []processCall {
 func (f *fixture) databaseCalls(command string) []string {
 	f.t.Helper()
 	var databases []string
+	if command == "mariadb" {
+		for _, call := range f.processes("selection") {
+			databases = append(databases, strings.ReplaceAll(call.Args[0], "``", "`"))
+		}
+		return databases
+	}
 	for _, call := range f.processes(command) {
 		found := false
 		for i, arg := range call.Args {
 			if command == "mariadb-dump" && arg == "--" && i+1 < len(call.Args) {
 				databases = append(databases, call.Args[i+1:]...)
-				found = true
-				break
-			}
-			if command == "mariadb" && strings.HasPrefix(arg, "--database=") {
-				databases = append(databases, strings.TrimPrefix(arg, "--database="))
 				found = true
 				break
 			}
@@ -527,7 +530,7 @@ func TestDefaultEntrypointAndRunWithoutSchedule(t *testing.T) {
 			f.run(true, args...)
 			assertEqual(t, f.databaseCalls("mariadb-dump"), []string{"app"})
 			calls := f.processes("mariadb-dump")
-			assertEqual(t, calls[0].Args[len(calls[0].Args)-4:], []string{"--skip-comments", "--ignore-table=app.tmp", "--", "app"})
+			assertEqual(t, calls[0].Args[len(calls[0].Args)-5:], []string{"--skip-comments", "--ignore-table=app.tmp", "--databases", "--", "app"})
 		})
 	}
 }
@@ -973,7 +976,7 @@ func TestBackupModesGroupSelectedDatabases(t *testing.T) {
 				assertEqual(t, keys(f.s3.calls("PUT")), wantKeys)
 				for _, call := range calls {
 					joined := " " + strings.Join(call.Args, " ") + " "
-					assertEqual(t, strings.Contains(joined, " --databases "), mode == "combined")
+					assertEqual(t, strings.Contains(joined, " --databases "), true)
 					for _, required := range []string{"--single-transaction", "--quick", "--routines", "--events", "--triggers", "--hex-blob"} {
 						if !strings.Contains(joined, " "+required+" ") {
 							t.Errorf("missing dump option %s: %v", required, call.Args)

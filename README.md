@@ -129,6 +129,7 @@ any required object definers separately on the restore server.
 | `S3_ALLOW_HTTP` | `false` | Permit cleartext HTTP for a trusted development endpoint |
 | `S3_UPLOAD_BUFFER` | `memory` | Stream with bounded part buffers, or use `disk` to stage the complete object in `TMPDIR` |
 | `S3_UPLOAD_PART_SIZE_MB` | `8` | Part size in MiB, 5–64 for memory and 5–5120 for disk |
+| `RESTORE_DATABASE_DEFAULTS` | Empty | Source charset and collation for a single-database dump missing those settings (JSON example below) |
 | `RESTORE_LOG_ERROR_DETAILS` | `false` | Include raw MariaDB diagnostics during restore. These can contain row values. |
 | `BACKUP_TIMEOUT` | `24h` | Positive Go duration for an entire backup run, including discovery, all databases and retention |
 | `PASSPHRASE` | Empty | GPG symmetric encryption passphrase, without newlines; passed through a dedicated file descriptor |
@@ -270,10 +271,23 @@ partially restored database, and objects absent from the dump are not removed.
 Use the same `S3_PREFIX`, `BACKUP_MODE`, `BACKUP_FILENAME_MODE`, and `PASSPHRASE`
 as the backup. Set database connection variables to the destination server.
 
-In per-database mode, set `MARIADB_DATABASE` to the database whose backup you want
-to restore. The destination database must already exist. Other database selection
-variables do not affect per-database restore; clear them to keep the configuration
-unambiguous.
+In per-database mode, set `MARIADB_DATABASE` to the database to restore. New
+backups include the source database's native `CREATE DATABASE` metadata.
+Restore creates a missing database with the saved character set and collation.
+The restore account needs `CREATE` for that operation. For an existing database,
+restore compares the source settings and reports any difference before importing
+SQL. It leaves existing database defaults and comments in place. A dump that
+requires a different database default for a stored routine can be restored into
+a new database.
+
+If an older dump lacks some or all source settings, an existing destination can
+be restored with its current defaults. The log warns that source defaults could not
+be fully verified. To create a missing database from such a dump, supply the original
+settings, for example in your environment file:
+
+```text
+RESTORE_DATABASE_DEFAULTS={"app":{"character_set":"utf8mb4","collation":"utf8mb4_bin"}}
+```
 
 ```sh
 docker run --rm --env-file .env mariadb-backup-s3:11.4 mariadb-backup-s3 restore
