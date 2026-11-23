@@ -130,14 +130,14 @@ func TestDumpOptionsPreserveOutputAndSelection(t *testing.T) {
 }
 
 func TestScheduleCompatibility(t *testing.T) {
-	for _, spec := range []string{"@weekly", "@daily", "@every 1h", "0 2 * * *", "0 0 2 * * *", "CRON_TZ=Asia/Tokyo 0 2 * * *"} {
-		schedule, err := scheduleParser().Parse(spec)
+	for _, spec := range []string{"@weekly", "@daily", "@every 1h", "0 2 * * *", "0 0 2 * * *", "CRON_TZ=Asia/Tokyo 0 2 * * *", "TZ=UTC\t0 2 * * *"} {
+		schedule, err := parseSchedule(spec)
 		if err != nil || schedule.Next(time.Now()).IsZero() {
 			t.Errorf("invalid schedule %q: %v", spec, err)
 		}
 	}
-	for _, spec := range []string{"", "garbage", "* *", "61 * * * * *"} {
-		if _, err := scheduleParser().Parse(spec); err == nil {
+	for _, spec := range []string{"", "garbage", "* *", "61 * * * * *", "CRON_TZ=Asia/Tokyo", "TZ=UTC\t"} {
+		if _, err := parseSchedule(spec); err == nil {
 			t.Errorf("accepted invalid schedule %q", spec)
 		}
 	}

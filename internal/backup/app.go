@@ -29,8 +29,13 @@ func New(c Config, store storage.Store, out, stderr io.Writer) *App {
 	return &App{Config: c, Store: store, Out: out, Err: stderr, now: time.Now, lockPath: "/tmp/mariadb-backup-s3.lock"}
 }
 
-func scheduleParser() cron.Parser {
-	return cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+func parseSchedule(spec string) (cron.Schedule, error) {
+	spec = strings.Join(strings.Fields(spec), " ")
+	if (strings.HasPrefix(spec, "TZ=") || strings.HasPrefix(spec, "CRON_TZ=")) && !strings.ContainsRune(spec, ' ') {
+		return nil, fmt.Errorf("missing cron expression after timezone")
+	}
+	parser := cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	return parser.Parse(spec)
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -40,7 +45,7 @@ func (a *App) Run(ctx context.Context) error {
 	if _, err := a.Config.validateBackup(); err != nil {
 		return err
 	}
-	schedule, err := scheduleParser().Parse(a.Config.Schedule)
+	schedule, err := parseSchedule(a.Config.Schedule)
 	if err != nil {
 		return fmt.Errorf("invalid SCHEDULE: %w", err)
 	}
