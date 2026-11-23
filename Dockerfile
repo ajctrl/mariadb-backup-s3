@@ -40,6 +40,7 @@ ENV SCHEDULE=''
 ENV PASSPHRASE=''
 ENV BACKUP_KEEP_DAYS=''
 ENV BACKUP_FILENAME_MODE='timestamp'
+ENV BACKUP_ALLOW_UNVERSIONED_OVERWRITE='false'
 
 COPY --chmod=755 src/run.sh src/backup.sh src/restore.sh /
 COPY LICENSE LICENSE.txt /usr/share/licenses/mariadb-backup-s3/

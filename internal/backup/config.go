@@ -12,15 +12,16 @@ import (
 	"github.com/ajctrl/mariadb-backup-s3/internal/storage"
 )
 
-const timestampLayout = "2006-01-02T15:04:05"
+const secondTimestampLayout = "2006-01-02T15:04:05"
+const timestampLayout = secondTimestampLayout + ".000000000"
 
-var timestampPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$`)
-var backupSuffixPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.sql(\.gpg)?$`)
+var timestampPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{9})?$`)
 
 type Config struct {
 	Database, Databases, BackupAll, Exclude, BackupMode  string
 	Host, Port, User, Password, DumpOptions, SSLCA       string
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule string
+	AllowUnversionedOverwrite                            bool
 	Storage                                              storage.Config
 }
 
@@ -72,6 +73,12 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if c.FilenameMode != "timestamp" && c.FilenameMode != "fixed" {
 		return c, fmt.Errorf("BACKUP_FILENAME_MODE must be timestamp or fixed.")
+	}
+	if value, set := lookup("BACKUP_ALLOW_UNVERSIONED_OVERWRITE"); set {
+		if value != "true" && value != "false" {
+			return c, fmt.Errorf("BACKUP_ALLOW_UNVERSIONED_OVERWRITE must be true or false.")
+		}
+		c.AllowUnversionedOverwrite = value == "true"
 	}
 	partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", "8"), 10, 64)
 	if err != nil || partSize < 5 || partSize > 5120 {
@@ -222,6 +229,16 @@ func (c Config) backupKey(database string, now time.Time) string {
 }
 
 func (c Config) isTimestampBackup(database, key string) bool {
-	prefix := c.timestampPrefix(database)
-	return strings.HasPrefix(key, prefix) && backupSuffixPattern.MatchString(strings.TrimPrefix(key, prefix))
+	name, hasPrefix := strings.CutPrefix(key, c.timestampPrefix(database))
+	timestamp, hasSuffix := strings.CutSuffix(strings.TrimSuffix(name, ".gpg"), ".sql")
+	return hasPrefix && hasSuffix && validBackupTimestamp(timestamp)
+}
+
+func validBackupTimestamp(timestamp string) bool {
+	if !timestampPattern.MatchString(timestamp) {
+		return false
+	}
+	// time.Parse allows fractional seconds after the seconds field.
+	_, err := time.Parse(secondTimestampLayout, timestamp)
+	return err == nil
 }

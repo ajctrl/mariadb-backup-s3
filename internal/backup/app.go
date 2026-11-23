@@ -124,15 +124,24 @@ func (a *App) backup(ctx context.Context, runner commandRunner) error {
 	// The shell implementation captured epoch seconds at run start. Preserve
 	// that boundary so objects at the cutoff second are still retained.
 	cutoff := a.now().UTC().Truncate(time.Second).Add(-time.Duration(days) * 24 * time.Hour)
-	if a.Config.FilenameMode == "fixed" {
+	// A scheduled run must check again even if the previous run fell back.
+	naming := a.Config
+	if naming.FilenameMode == "fixed" {
 		enabled, err := a.Store.VersioningEnabled(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil || !enabled {
+			reason := "S3 bucket versioning is not enabled"
+			if err != nil {
+				reason = fmt.Sprintf("Could not verify S3 bucket versioning: %v", err)
 			}
-			fmt.Fprintf(a.Err, "Warning: Could not verify S3 bucket versioning: %v. Continuing with fixed filenames; if versioning is disabled, uploading will overwrite the previous backup without preserving it.\n", err)
-		} else if !enabled {
-			return fmt.Errorf("Fixed filenames require S3 bucket versioning to be Enabled.")
+			if naming.AllowUnversionedOverwrite {
+				fmt.Fprintf(a.Err, "Warning: %s. Using fixed filenames because BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true. This may overwrite the previous backup.\n", reason)
+			} else {
+				naming.FilenameMode = "timestamp"
+				fmt.Fprintf(a.Err, "Warning: %s. Using timestamped filenames for this run.\n", reason)
+			}
 		}
 	}
 	databases, err := a.databases(ctx, runner)
@@ -153,11 +162,16 @@ func (a *App) backup(ctx context.Context, runner commandRunner) error {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := a.backupDatabases(ctx, runner, group); err != nil {
+		backupTime := a.now()
+		key := naming.backupKey(database, backupTime)
+		if err := a.backupDatabases(ctx, runner, group, key); err != nil {
 			fmt.Fprintf(a.Err, "Backup failed: %s: %v\n", label, err)
 			failed++
 		} else {
 			succeeded++
+			if naming.FilenameMode != a.Config.FilenameMode {
+				a.logFallbackRestore(database, key, backupTime)
+			}
 			if days > 0 {
 				if err := a.removeOldBackups(ctx, database, cutoff); err != nil {
 					fmt.Fprintf(a.Err, "Retention cleanup failed: %s: %v\n", label, err)
@@ -236,9 +250,16 @@ func (a *App) databases(ctx context.Context, runner commandRunner) ([]string, er
 	return selected, nil
 }
 
-func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databases []string) error {
-	database := databases[0]
-	key := a.Config.backupKey(database, a.now())
+func (a *App) logFallbackRestore(database, key string, backupTime time.Time) {
+	// Quote the literal database name for a POSIX shell, including embedded single quotes.
+	selection := "BACKUP_MODE=per-database MARIADB_DATABASE='" + strings.ReplaceAll(database, "'", "'\\''") + "'"
+	if a.Config.BackupMode == "combined" {
+		selection = "BACKUP_MODE=combined MARIADB_DATABASE= MARIADB_DATABASES= MARIADB_DATABASES_EXCLUDE= MARIADB_BACKUP_ALL=false"
+	}
+	fmt.Fprintf(a.Out, "Saved fallback S3 key: %q\nRestore command: BACKUP_FILENAME_MODE=timestamp %s mariadb-backup-s3 restore %s\n", key, selection, backupTime.UTC().Format(timestampLayout))
+}
+
+func (a *App) backupDatabases(ctx context.Context, runner commandRunner, databases []string, key string) error {
 	label := strings.Join(databases, ", ")
 	fmt.Fprintf(a.Out, "Creating backup of databases: %s...\n", label)
 	opts, err := a.Config.dumpOptions()
@@ -354,7 +375,7 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 		if c.FilenameMode != "timestamp" {
 			return fmt.Errorf("Use --version-id ID to restore a previous fixed-name backup.")
 		}
-		if !timestampPattern.MatchString(args[0]) {
+		if !validBackupTimestamp(args[0]) {
 			return fmt.Errorf("Invalid backup timestamp.")
 		}
 		timestamp = args[0]
@@ -380,8 +401,15 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 				if err != nil {
 					return fmt.Errorf("Could not list backups: %w", err)
 				}
+				prefix, suffix := c.timestampPrefix(c.Database), c.fileType()
+				var latestTimestamp string
 				for _, object := range objects {
-					if strings.HasSuffix(object.Key, c.fileType()) && object.Key > key {
+					if !strings.HasSuffix(object.Key, suffix) {
+						continue
+					}
+					objectTimestamp := strings.TrimSuffix(strings.TrimPrefix(object.Key, prefix), suffix)
+					if objectTimestamp > latestTimestamp {
+						latestTimestamp = objectTimestamp
 						key = object.Key
 					}
 				}

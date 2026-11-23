@@ -74,12 +74,6 @@ func TestDockerBackupRestore(t *testing.T) {
 	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-		Bucket:                  aws.String(bucket),
-		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	sql := func(t *testing.T, query string) string {
 		t.Helper()
@@ -198,6 +192,27 @@ func TestDockerBackupRestore(t *testing.T) {
 		assertSchema(t)
 	}) {
 		return
+	}
+	if !t.Run("fixed_fallback_restore", func(t *testing.T) {
+		env := map[string]string{"S3_PREFIX": "fallback", "BACKUP_FILENAME_MODE": "fixed"}
+		runBackupImage(t, env)
+		keys := listKeys(t, "fallback/")
+		if len(keys) != 1 || !strings.HasPrefix(keys[0], "fallback/app/") || !strings.HasSuffix(keys[0], ".sql") {
+			t.Fatalf("expected one fallback dump, got %v", keys)
+		}
+		timestamp := strings.TrimSuffix(strings.TrimPrefix(keys[0], "fallback/app/"), ".sql")
+		sql(t, "UPDATE app.backup_probe SET value = 'changed'")
+		env["BACKUP_FILENAME_MODE"] = "timestamp"
+		runBackupImage(t, env, "mariadb-backup-s3", "restore", timestamp)
+		assertValue(t, "original")
+	}) {
+		return
+	}
+	if _, err := client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket:                  aws.String(bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if !t.Run("per_database_selected", func(t *testing.T) {
 		env := map[string]string{

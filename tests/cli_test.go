@@ -432,7 +432,7 @@ func TestBackupSingleDatabaseAndLiteralNames(t *testing.T) {
 			calls := f.s3.calls("PUT")
 			assertEqual(t, len(calls), 1)
 			encoded := strings.ReplaceAll(url.QueryEscape(name), "+", "%20")
-			pattern := "^" + regexp.QuoteMeta("backup/"+encoded+"/") + `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.sql$`
+			pattern := "^" + regexp.QuoteMeta("backup/"+encoded+"/") + `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}\.sql$`
 			if !regexp.MustCompile(pattern).MatchString(calls[0].Key) {
 				t.Fatalf("unexpected timestamp key: %q", calls[0].Key)
 			}
@@ -511,6 +511,8 @@ func TestInvalidSelectionAndRetentionNeverAccessDatabaseOrS3(t *testing.T) {
 		{"MARIADB_DATABASE": "app\nother"},
 		{"MARIADB_DATABASE": "app", "MARIADB_DATABASES_EXCLUDE": "other"},
 		{"MARIADB_DATABASE": "app", "BACKUP_FILENAME_MODE": "wrong"},
+		{"MARIADB_DATABASE": "app", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "TRUE"},
+		{"MARIADB_DATABASE": "app", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": ""},
 		{"MARIADB_DATABASE": "app", "BACKUP_MODE": "wrong"},
 	}
 	for _, value := range []string{"0", "-1", "abc", "08", "1.5", "999999999999"} {
@@ -665,45 +667,97 @@ func TestGPGRejectsMultilinePassphrase(t *testing.T) {
 	}
 }
 
-func TestFixedBackupRequiresEnabledVersioning(t *testing.T) {
-	for _, status := range []string{"", "Suspended"} {
-		t.Run(status, func(t *testing.T) {
+func TestFixedFilenamePolicy(t *testing.T) {
+	for _, status := range []string{"Enabled", "Suspended", "", "AccessDenied"} {
+		for _, override := range []string{"false", "true"} {
+			t.Run(status+"/override="+override, func(t *testing.T) {
+				f := newFixture(t)
+				f.env["MARIADB_DATABASE"], f.env["BACKUP_FILENAME_MODE"] = "app", "fixed"
+				f.env["BACKUP_ALLOW_UNVERSIONED_OVERWRITE"] = override
+				f.s3.versioning = status
+				if status == "AccessDenied" {
+					f.s3.fail = "versioning"
+				}
+				output := f.run(true, "backup")
+				assertEqual(t, len(f.s3.calls("versioning")), 1)
+				puts := f.s3.calls("PUT")
+				assertEqual(t, len(puts), 1)
+				fallback := status != "Enabled" && override == "false"
+				assertEqual(t, puts[0].Key == "backup/app_latest.sql", !fallback)
+				assertEqual(t, strings.Contains(output, "Restore command:"), fallback)
+				assertEqual(t, strings.Contains(output, "Warning:"), status != "Enabled")
+				if status != "Enabled" && override == "true" && !strings.Contains(output, "overwrite the previous backup") {
+					t.Fatal(output)
+				}
+				if status == "AccessDenied" && !strings.Contains(output, "AccessDenied") {
+					t.Fatal(output)
+				}
+			})
+		}
+	}
+}
+
+func TestFallbackRestoreCommand(t *testing.T) {
+	for _, mode := range []string{"per-database", "combined"} {
+		t.Run(mode, func(t *testing.T) {
 			f := newFixture(t)
-			f.env["MARIADB_DATABASE"], f.env["BACKUP_FILENAME_MODE"] = "app", "fixed"
-			f.s3.versioning = status
-			f.run(false, "backup")
-			assertEqual(t, len(f.processes("mariadb-dump")), 0)
-			assertEqual(t, len(f.s3.calls("PUT")), 0)
+			f.s3.fail = "versioning"
+			f.env["BACKUP_MODE"], f.env["BACKUP_FILENAME_MODE"] = mode, "fixed"
+			f.env["MARIADB_DATABASES"] = "app,team's db"
+			f.env["PASSPHRASE"] = "test-passphrase"
+			f.env["PATH"] = filepath.Dir(cliBinary) + string(os.PathListSeparator) + f.env["PATH"]
+			output := f.run(true, "backup")
+			assertEqual(t, len(f.s3.calls("versioning")), 1)
+			puts := f.s3.calls("PUT")
+			wantCount := 2
+			if mode == "combined" {
+				wantCount = 1
+			}
+			assertEqual(t, len(puts), wantCount)
+			var commands []string
+			for _, line := range strings.Split(output, "\n") {
+				if command, ok := strings.CutPrefix(line, "Restore command: "); ok {
+					commands = append(commands, command)
+				}
+			}
+			assertEqual(t, len(commands), wantCount)
+			for i, command := range commands {
+				if !strings.Contains(output, fmt.Sprintf("Saved fallback S3 key: %q", puts[i].Key)) || !strings.HasSuffix(puts[i].Key, ".sql.gpg") {
+					t.Fatal(output)
+				}
+				cmd := f.command()
+				cmd.Path, cmd.Args = "/bin/sh", []string{"sh", "-c", command}
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("restore command failed: %v\n%s", err, out)
+				}
+			}
+			assertEqual(t, keys(f.s3.calls("GET")), keys(puts))
+			if mode == "per-database" {
+				assertEqual(t, f.databaseCalls("mariadb"), []string{"app", "team's db"})
+			}
 		})
 	}
 }
 
-func TestFixedBackupWarnsAndContinuesWhenVersioningCheckFails(t *testing.T) {
-	for _, mode := range []string{"per-database", "combined"} {
-		for _, uploadFails := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/uploadFails=%t", mode, uploadFails), func(t *testing.T) {
-				f := newFixture(t)
-				f.env["MARIADB_DATABASE"], f.env["BACKUP_FILENAME_MODE"], f.env["BACKUP_MODE"] = "app", "fixed", mode
-				f.s3.fail = "versioning"
-				if uploadFails {
-					f.s3.uploadFailure = "latest.sql"
-				}
-				output := f.run(!uploadFails, "backup")
-				for _, message := range []string{"Warning: Could not verify S3 bucket versioning", "AccessDenied", "overwrite the previous backup"} {
-					if !strings.Contains(output, message) {
-						t.Fatalf("missing warning detail %q: %s", message, output)
-					}
-				}
-				assertEqual(t, len(f.s3.calls("versioning")), 1)
-				assertEqual(t, len(f.processes("mariadb-dump")), 1)
-				key := "backup/app_latest.sql"
-				if mode == "combined" {
-					key = "backup/latest.sql"
-				}
-				assertEqual(t, keys(f.s3.calls("PUT")), []string{key})
-			})
-		}
+func TestFallbackUploadFailure(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"], f.env["BACKUP_FILENAME_MODE"] = "app", "fixed"
+	f.s3.fail, f.s3.uploadFailure = "versioning", ".sql"
+	output := f.run(false, "backup")
+	assertEqual(t, len(f.s3.calls("PUT")), 1)
+	if strings.Contains(output, "Restore command:") || !strings.Contains(output, "1 failed") {
+		t.Fatal(output)
 	}
+}
+
+func TestTimestampIgnoresOverwriteOverride(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"], f.env["BACKUP_ALLOW_UNVERSIONED_OVERWRITE"] = "app", "true"
+	f.run(true, "backup")
+	assertEqual(t, len(f.s3.calls("versioning")), 0)
+	puts := f.s3.calls("PUT")
+	assertEqual(t, len(puts), 1)
+	assertEqual(t, strings.HasPrefix(puts[0].Key, "backup/app/"), true)
 }
 
 func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
@@ -824,8 +878,8 @@ func TestLatestRestoreExactMatchingAndPagination(t *testing.T) {
 		key := "backup/app/" + time.Date(2020, 1, 1, 0, 0, i, 0, time.UTC).Format("2006-01-02T15:04:05") + ".sql"
 		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2020-01-01T00:00:00Z"})
 	}
-	want := f.s3.objects[1000].Key
-	for _, key := range []string{"backup/app/extra_2030-01-01T00:00:00.sql", "backup/app/2025-01-01T00:00:00.sql.gpg", "backup/app/2040-01-01T00%3A00%3A00/latest.sql"} {
+	want := strings.TrimSuffix(f.s3.objects[1000].Key, ".sql") + ".123456789.sql"
+	for _, key := range []string{want, "backup/app/extra_2030-01-01T00:00:00.sql", "backup/app/2025-01-01T00:00:00.sql.gpg", "backup/app/2040-01-01T00%3A00%3A00/latest.sql", "backup/app/9999-99-99T99:99:99.sql"} {
 		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2000-01-01T00:00:00Z"})
 	}
 	f.run(true, "restore")
@@ -837,6 +891,14 @@ func TestLatestRestoreExactMatchingAndPagination(t *testing.T) {
 			t.Fatal("mariadb must stop on SQL errors")
 		}
 	}
+}
+
+func TestExplicitRestoreAcceptsNanosecondTimestamp(t *testing.T) {
+	f := newFixture(t)
+	f.env["MARIADB_DATABASE"] = "app"
+	timestamp := "2020-01-01T00:00:00.123456789"
+	f.run(true, "restore", timestamp)
+	assertEqual(t, keys(f.s3.calls("GET")), []string{"backup/app/" + timestamp + ".sql"})
 }
 
 func TestBackupModesGroupSelectedDatabases(t *testing.T) {
@@ -1057,6 +1119,7 @@ func TestRestoreInvalidArgumentsNeverAccessServices(t *testing.T) {
 	}{
 		{"", "timestamp", nil}, {"app", "timestamp", []string{"--version-id", "id"}},
 		{"app", "timestamp", []string{"bad-timestamp"}}, {"app", "timestamp", []string{"2020-01-01T00:00:00\n"}},
+		{"app", "timestamp", []string{"2021-02-29T00:00:00"}}, {"app", "timestamp", []string{"2020-01-01T24:00:00.123456789"}},
 		{"app", "fixed", []string{"2020-01-01T00:00:00"}}, {"app", "fixed", []string{"--version-id", ""}},
 		{"app", "timestamp", []string{"a", "b", "c"}},
 	} {

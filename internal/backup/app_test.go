@@ -35,7 +35,7 @@ func TestRetentionBoundaryAndExactMatching(t *testing.T) {
 	cutoff := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	expired := []storage.Object{
 		{Key: "backup/app/2026-09-05T11:59:59.sql", LastModified: cutoff.Add(-time.Second)},
-		{Key: "backup/app/2026-09-05T11:59:59.sql.gpg", LastModified: cutoff.Add(-time.Nanosecond)},
+		{Key: "backup/app/2026-09-05T11:59:59.123456789.sql.gpg", LastModified: cutoff.Add(-time.Nanosecond)},
 	}
 	objects := append([]storage.Object{}, expired...)
 	objects = append(objects,
@@ -46,6 +46,7 @@ func TestRetentionBoundaryAndExactMatching(t *testing.T) {
 		"backup/app_latest.sql", "backup/app_latest.sql.gpg", "backup/app/extra_2000-01-01T00:00:00.sql",
 		"backup/app/2000-01-01T00%3A00%3A00/latest.sql", "backup/other_2000-01-01T00:00:00.sql",
 		"backup/app/notes.sql", "backup/app/2000-01-01T00:00:00.sql.extra", "backup/app/2000-01-01T00:00:00.sql\n",
+		"backup/app/2025-02-29T00:00:00.sql", "backup/app/2026-09-05T23:59:60.000000000.sql.gpg",
 	} {
 		objects = append(objects, storage.Object{Key: key, LastModified: cutoff.Add(-time.Hour)})
 	}

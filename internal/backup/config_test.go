@@ -83,8 +83,8 @@ func TestNamesAndKeysSeparateBackupModes(t *testing.T) {
 		{"backup//", "backup/", "backup/"}, {"", "", ""}, {"/", "", ""},
 	} {
 		c := Config{Prefix: tc.prefix, FilenameMode: "timestamp"}
-		date := time.Date(2026, 9, 12, 12, 30, 0, 0, time.FixedZone("plus2", 2*3600))
-		if got := c.backupKey("app", date); got != tc.timestampPrefix+"app/2026-09-12T10:30:00.sql" {
+		date := time.Date(2026, 9, 12, 12, 30, 0, 123456789, time.FixedZone("plus2", 2*3600))
+		if got := c.backupKey("app", date); got != tc.timestampPrefix+"app/2026-09-12T10:30:00.123456789.sql" {
 			t.Errorf("timestamp prefix %q: %q", tc.prefix, got)
 		}
 		c.FilenameMode, c.Passphrase = "fixed", "secret"
@@ -98,9 +98,15 @@ func TestNamesAndKeysSeparateBackupModes(t *testing.T) {
 			t.Errorf("combined fixed key: %q", got)
 		}
 		c.FilenameMode = "timestamp"
-		if got := c.backupKey("app", date); got != tc.timestampPrefix+"2026-09-12T10:30:00.sql.gpg" {
+		if got := c.backupKey("app", date); got != tc.timestampPrefix+"2026-09-12T10:30:00.123456789.sql.gpg" {
 			t.Errorf("combined timestamp key: %q", got)
 		}
+	}
+	c := Config{Prefix: "backup", FilenameMode: "timestamp"}
+	first := time.Date(2026, 9, 12, 10, 30, 0, 1, time.UTC)
+	second := first.Add(time.Nanosecond)
+	if firstKey, secondKey := c.backupKey("app", first), c.backupKey("app", second); firstKey == secondKey || firstKey >= secondKey {
+		t.Errorf("sub-second timestamp keys are not unique and sortable: %q, %q", firstKey, secondKey)
 	}
 	for _, names := range [][]string{nil, {""}, {"app", ""}, {"a\nb"}, {"a\x00b"}, {"a\x7fb"}, {string([]byte{0xff})}} {
 		if err := validateDatabases(names); err == nil {

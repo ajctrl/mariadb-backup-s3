@@ -105,6 +105,7 @@ any required object definers separately on the restore server.
 | `SCHEDULE` | Empty | Cron expression, optionally including seconds, or a descriptor such as `@daily` |
 | `BACKUP_KEEP_DAYS` | Empty | Delete expired timestamped backups after a successful backup; positive integer, at most 36500 |
 | `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` or `fixed`; enable bucket versioning to preserve previous fixed-name backups |
+| `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` | `false` | In fixed mode, `true` permits overwriting the fixed key when bucket versioning is suspended, unset, or cannot be checked |
 
 Mount the certificate into the container when using `MARIADB_SSL_CA`. Database
 credentials and restore downloads use temporary files; allow writable temporary
@@ -136,9 +137,9 @@ transaction without another consistency mechanism removes its snapshot guarantee
 ## S3 layout and retention
 
 ```text
-backup/app/2026-09-12T03:00:00.sql
-backup/analytics/2026-09-12T03:00:01.sql
-backup-combined/2026-09-12T03:00:00.sql
+backup/app/2026-09-12T03:00:00.123456789.sql
+backup/analytics/2026-09-12T03:00:01.234567890.sql
+backup-combined/2026-09-12T03:00:00.345678901.sql
 ```
 
 With timestamp filenames, per-database mode writes to
@@ -147,6 +148,8 @@ With timestamp filenames, per-database mode writes to
 for per-database mode and `S3_PREFIX=backup-combined` for combined mode. Set a
 distinct prefix for each source server and each combined selection. An empty
 `S3_PREFIX` writes directly under `<database>/` or the bucket root, respectively.
+New timestamps use UTC with nine fractional digits. Restore and retention also
+recognize older timestamps that end at whole seconds.
 
 Fixed filename mode writes per-database backups to
 `S3_PREFIX/<database>_latest.sql` and combined backups to `S3_PREFIX/latest.sql`.
@@ -160,10 +163,20 @@ backup-combined/latest.sql
 
 Database names in paths and filenames are URL-encoded. Encrypted backups end in
 `.sql.gpg`.
-Before uploading, fixed mode checks bucket versioning. If the check fails (for
-example, `GetBucketVersioning` returns 403 AccessDenied), it logs a warning and
-continues. Without versioning, uploading overwrites the previous backup without
-preserving it. If the check succeeds and versioning is not enabled, backup stops.
+Fixed mode checks bucket versioning once per run. For an enabled bucket it uses
+fixed keys. If versioning is suspended, unset, or the check fails (for example,
+with `AccessDenied`), it warns and writes timestamped backups for that run.
+Each successful fallback upload logs the S3 key and a restore command to run
+with the same storage and encryption settings and the intended destination
+database connection. A fixed-name restore still reads the fixed key, which may
+be older or absent.
+
+Deployments that previously updated fixed keys after a versioning check error
+now fall back by default. To keep writing fixed keys, enable bucket versioning
+and grant the backup key access to `GetBucketVersioning`, or explicitly set
+`BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true` to accept possible loss of the previous
+backup. The override also applies when the bucket reports suspended or unset
+versioning. Timestamp mode always uses timestamped keys.
 Latest-file searches and retention only match backup files directly in the
 current database directory or combined prefix.
 
@@ -197,7 +210,7 @@ unambiguous.
 
 ```sh
 docker run --rm --env-file template.env mariadb-backup-s3:11.4 mariadb-backup-s3 restore
-docker run --rm --env-file template.env mariadb-backup-s3:11.4 mariadb-backup-s3 restore 2026-09-12T03:00:00
+docker run --rm --env-file template.env mariadb-backup-s3:11.4 mariadb-backup-s3 restore 2026-09-12T03:00:00.123456789
 ```
 
 Combined dumps contain `CREATE DATABASE` and `USE` statements. Combined restore
