@@ -14,6 +14,7 @@ DOCKER_TAGS = "https://hub.docker.com/v2/namespaces/library/repositories/mariadb
 SERIES = r"[0-9]+\.[0-9]+"
 DIGEST = r"sha256:[0-9a-f]{64}"
 STAGE = re.compile(rf"^FROM mariadb:({SERIES})\.[0-9]+@{DIGEST} AS client-\1$", re.M)
+README_TAGS = re.compile(r"^Supported image tags: (.*)$", re.M)
 
 
 def fetch(url):
@@ -25,7 +26,22 @@ def supported(dockerfile):
     series = STAGE.findall(dockerfile)
     if not series or len(set(series)) != len(series) or len(series) != dockerfile.count("FROM mariadb:"):
         raise ValueError("Expected one pinned Dockerfile stage per MariaDB series")
+    global_args = re.split(r"^FROM\s", dockerfile, maxsplit=1, flags=re.M | re.I)[0]
+    defaults = re.findall(r"^ARG MARIADB_SERIES=(.*)$", global_args, re.M)
+    if len(defaults) != 1 or defaults[0] not in series:
+        raise ValueError("The default MARIADB_SERIES must name a pinned client stage")
     return sorted(series, key=lambda s: tuple(map(int, s.split("."))))
+
+
+def series_matrix(dockerfile, readme):
+    series = supported(dockerfile)
+    lists = README_TAGS.findall(readme)
+    if len(lists) != 1:
+        raise ValueError("Expected one supported image tag list in README.md")
+    tags = [tag.strip() for tag in lists[0].removesuffix(".").split(",")]
+    if sorted(tags) != sorted(f"`{s}`" for s in series):
+        raise ValueError("The supported image tags in README.md must match the pinned client stages")
+    return series
 
 
 def stable_lts(catalog, today):
@@ -103,8 +119,7 @@ def add_series(root, series, version, digest):
     })
     readme = root / "README.md"
     tags = ", ".join(f"`{s}`" for s in supported(source))
-    docs, count = re.subn(r"^Supported image tags: .+$", f"Supported image tags: {tags}.",
-                          readme.read_text(), flags=re.M)
+    docs, count = README_TAGS.subn(f"Supported image tags: {tags}.", readme.read_text())
     if count != 1:
         raise ValueError("Expected one supported image tag list in README.md")
     dockerfile.write_text(source)
@@ -124,5 +139,5 @@ if __name__ == "__main__":
     if args.command == "add":
         add_series(Path("."), args.series, args.version, args.digest)
     else:
-        series = supported(Path("Dockerfile").read_text())
+        series = series_matrix(Path("Dockerfile").read_text(), Path("README.md").read_text())
         print(json.dumps(series if args.command == "matrix" else discover(series)))

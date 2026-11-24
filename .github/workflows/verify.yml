@@ -31,6 +31,8 @@ jobs:
           echo "series=$series" >> "$GITHUB_OUTPUT"
       - name: Verify LTS discovery and series additions
         run: python3 tests/ci/test_mariadb_lts.py
+      - name: Verify when restore compatibility tests are required
+        run: bash tests/ci/previous-image.sh
       - name: Test with race detector
         env:
           CLI_TEST_RACE: "1"
@@ -118,7 +120,13 @@ jobs:
           patch=${server#mariadb:}
           patch=${patch%@*}
           for tool in mariadb mariadb-dump; do
-            docker run --rm mariadb-backup-s3:integration "$tool" --version | grep -F "$patch"
+            version=$(docker run --rm mariadb-backup-s3:integration "$tool" --version)
+            echo "$version"
+            release=$(sed -nE 's/^.* (from|Distrib) ([^ ,]+)-MariaDB,.*/\2/p' <<< "$version")
+            if [[ "$release" != "$patch" ]]; then
+              echo "::error::Expected $tool to report MariaDB $patch"
+              exit 1
+            fi
           done
           s3=$(sed -n 's/^const defaultS3TestImage = "\([^"]*\)"$/\1/p' tests/integration/docker_test.go)
           docker pull "$server"

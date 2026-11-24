@@ -99,20 +99,12 @@ jobs:
           DIGEST: ${{ matrix.candidate.digest }}
         run: python3 .github/scripts/lts_proposal.py
       - if: steps.proposal.outputs.create == 'true'
-        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          base: main
-          branch: ${{ env.BRANCH }}
-          sign-commits: true
-          add-paths: |
-            Dockerfile
-            renovate.json
-            README.md
-          commit-message: "feat: support MariaDB ${{ env.SERIES }} LTS"
-          title: "Add MariaDB ${{ env.SERIES }} LTS"
-          body: |
+        name: Open the LTS proposal for manual review
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_BODY: |
             The MariaDB Foundation lists ${{ env.SERIES }} as a stable Community LTS.
             The pinned official MariaDB image in the Dockerfile includes Linux amd64 and arm64.
             Review both backup and restore jobs before manually merging to publish the new series.
             [Release catalog](https://downloads.mariadb.org/rest-api/mariadb/)
+        run: gh pr create --base main --head "$BRANCH" --title "Add MariaDB $SERIES LTS" --body "$PR_BODY"

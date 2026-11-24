@@ -1,4 +1,4 @@
-"""Refresh only the bot-owned Dockerfile pin in an open LTS proposal."""
+"""Create LTS proposals and refresh their bot-owned Dockerfile pins."""
 
 import base64
 import json
@@ -54,13 +54,52 @@ mutation($input:CreateCommitOnBranchInput!) {
 """
 
 
+def branch_head(repo, branch):
+    refs = api(f"repos/{repo}/git/matching-refs/heads/{branch}")
+    return next((r["object"]["sha"] for r in refs if r["ref"] == f"refs/heads/{branch}"), None)
+
+
+def prepare_first(repo, branch, series, version, digest, bot):
+    message = f"feat: support MariaDB {series} LTS"
+    existing = branch_head(repo, branch)
+    if existing:
+        # A prior run may have created the branch but failed to open its PR.
+        commit = api(f"repos/{repo}/commits/{existing}")
+        if (commit["commit"]["verification"]["verified"] and
+                (commit["author"] or {}).get("login") == bot and commit["commit"]["message"] == message):
+            return True
+        print(f"Skipping {branch}: an existing branch occupies this name")
+        return False
+
+    add_series(Path("."), series, version, digest)
+    base, base_tree = subprocess.check_output(["git", "rev-parse", "HEAD", "HEAD^{tree}"], text=True).split()
+    git_api = f"repos/{repo}/git"
+    files = [{"path": path, "mode": "100644", "type": "blob", "content": Path(path).read_text()}
+             for path in ("Dockerfile", "renovate.json", "README.md")]
+    tree = api(f"{git_api}/trees", payload={"base_tree": base_tree, "tree": files})
+    if tree["sha"] == base_tree:
+        return False
+    # The installation token supplies the bot identity and GitHub signature.
+    commit = api(f"{git_api}/commits", payload={"message": message, "tree": tree["sha"], "parents": [base]})
+    if not commit["verification"]["verified"]:
+        raise RuntimeError(f"GitHub could not verify the initial commit for {branch}")
+    try:
+        api(f"{git_api}/refs", payload={"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
+    except subprocess.CalledProcessError:
+        # Another writer can claim the name after our read. Never update that ref.
+        if not branch_head(repo, branch):
+            raise
+        print(f"Branch {branch} appeared during creation; skipping this run")
+        return False
+    return True
+
+
 def prepare(repo, branch, series, version, digest, bot):
     owner, name = repo.split("/")
     prs = api("--method", "GET", f"repos/{repo}/pulls", "-f", "base=main",
               "-f", f"head={owner}:{branch}", "-f", "state=all")
     if not prs:
-        add_series(Path("."), series, version, digest)
-        return True
+        return prepare_first(repo, branch, series, version, digest, bot)
     pr = next((p for p in prs if p["state"] == "open"), None)
     if not pr or pr["user"]["login"] != bot or pr["head"]["repo"]["full_name"] != repo:
         return False

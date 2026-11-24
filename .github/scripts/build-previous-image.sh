@@ -2,6 +2,7 @@
 # Build the PR base's backup tool when this series' image inputs change.
 set -euo pipefail
 previous=$(mktemp -d)
+trap 'rm -rf "$previous"' EXIT
 git archive "$BASE_SHA" | tar -x -C "$previous"
 stage=client-$MARIADB_SERIES
 server=$(awk -v s="$stage" '$1=="FROM" && $4==s {print $2}' "$previous/Dockerfile")
@@ -20,7 +21,7 @@ series_recipe() {
   awk -v s="$stage" '$1!="FROM" || $2 !~ /^mariadb:/ || $4==s' "$1"
 }
 if cmp -s <(series_recipe "$previous/Dockerfile") <(series_recipe Dockerfile) &&
-   cmp -s "$previous/src/install.sh" src/install.sh; then
+   git diff --quiet "$BASE_SHA" -- .dockerignore go.mod go.sum cmd internal src ':(exclude,glob)**/*_test.go'; then
   exit 0
 fi
 image=mariadb-backup-s3:previous
