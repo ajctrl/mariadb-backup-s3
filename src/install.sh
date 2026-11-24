@@ -1,16 +1,16 @@
 #!/bin/sh
-
 set -eu
 
-apk add --no-cache mariadb-client gpg gpg-agent ca-certificates
-
-# Keep the SQL client and dump tool; omit unrelated database administration tools.
-# This runs in the installation layer so removed files do not inflate the image.
-rm -f \
-    /usr/bin/mariadb-admin /usr/bin/mysqladmin \
-    /usr/bin/mariadb-check /usr/bin/mysqlcheck \
-    /usr/bin/mariadb-import /usr/bin/mysqlimport \
-    /usr/bin/mariadb-show /usr/bin/mysqlshow \
-    /usr/bin/mariadb-waitpid /usr/bin/mysql_waitpid \
-    /usr/bin/mariadb-secure-installation /usr/bin/mysql_secure_installation \
-    /usr/bin/myisam_ftdump
+# Keep the client, dump tool, authentication plugins and their shared libraries.
+# Purge the server before copying this filesystem into the final stage.
+export DEBIAN_FRONTEND=noninteractive
+apt-mark manual mariadb-client mariadb-client-core
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates gpg gpg-agent
+apt-get purge -y --auto-remove mariadb-server mariadb-server-core
+rm -rf /var/lib/apt/lists/* /var/lib/mysql /docker-entrypoint-initdb.d
+rm -f /usr/local/bin/docker-entrypoint.sh /usr/local/bin/healthcheck.sh
+mariadb --version
+mariadb-dump --version
+gpg --version
+test ! -e /usr/sbin/mariadbd
