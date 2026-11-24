@@ -13,8 +13,9 @@ encryption, scheduling, retention, and versioned fixed filenames. Based on
 
 ## Build and run
 
-Choose the image tag that matches your MariaDB server series. The tags
-`10.11`, `11.4`, `11.8`, and `12.3` contain the SQL client and dump utility
+Supported image tags: `10.11`, `11.4`, `11.8`, `12.3`.
+
+Choose the tag matching your server series. Each image contains the SQL client and dump utility
 from the matching official MariaDB image. CI tests backup and restore with
 that server on both `linux/amd64` and `linux/arm64`. A plain local build and
 the Compose example use `11.4`. To build another series, pass e.g.
@@ -25,7 +26,13 @@ under `<series>-sha-<commit>` and promotes its series tag while that commit
 is still the head of `main`. For example, pull
 `ghcr.io/ajctrl/mariadb-backup-s3:11.8` for an 11.8 server.
 Renovate checks daily at 03:17 UTC and updates the pinned client and test
-server together within each supported series.
+server together within each supported series. At the same time, the workflow checks
+the [MariaDB Foundation release catalog](https://mariadb.org/downloads-rest-api/)
+for new stable Community LTS series. Once a numeric patch tag is available for
+both Linux architectures in the official MariaDB image, the GitHub App opens
+one PR for that series. Review its backup and restore results and merge the
+first PR manually. Later patch and digest PRs follow the usual Renovate policy.
+Closing a series proposal leaves it closed on future checks. Reopen it to resume.
 
 Use the same client family to dump and restore,
 and test restoration before relying on backups across server versions.
