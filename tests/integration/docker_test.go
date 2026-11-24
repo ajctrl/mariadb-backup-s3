@@ -21,7 +21,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-const defaultS3TestImage = "docker.io/jcometki/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+const defaultMariaDBTestImage = "mariadb:11.4.13@sha256:a8992b5e5404d11e03c54a31d0c1bdea3fd116d283aa6d1a627551f29045309b"
+const defaultS3TestImage = "docker.io/jcometki/minio:RELEASE.2025-09-07T16-13-09Z-multiarch@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
 
 // TestDockerBackupRestore requires a local Docker daemon and an already-built
 // backup image. All credentials, containers and stored data belong to this test.
@@ -46,7 +47,7 @@ func TestDockerBackupRestore(t *testing.T) {
 	docker(t, ctx, "run", "-d", "--name", mariadb, "--network", name, "--network-alias", "mariadb",
 		"-p", "127.0.0.1::9000",
 		"-e", "MARIADB_ROOT_PASSWORD=integration-password", "-e", "MARIADB_DATABASE=app",
-		envOr("MARIADB_TEST_IMAGE", "mariadb:11.4"))
+		envOr("MARIADB_TEST_IMAGE", defaultMariaDBTestImage))
 	// Sharing one isolated network namespace also works on Docker hosts that
 	// disable communication between containers on a bridge network.
 	docker(t, ctx, "run", "-d", "--name", minio, "--network", "container:"+mariadb,
@@ -128,7 +129,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		"S3_ACCESS_KEY_ID": "integration", "S3_SECRET_ACCESS_KEY": "integration-password",
 	}
 	runNumber := 0
-	runImage := func(t *testing.T, overrides map[string]string, command ...string) (string, error) {
+	runWithImage := func(t *testing.T, image string, overrides map[string]string, command ...string) (string, error) {
 		t.Helper()
 		runNumber++
 		container := fmt.Sprintf("%s-run-%d", name, runNumber)
@@ -153,6 +154,10 @@ func TestDockerBackupRestore(t *testing.T) {
 		args = append(args, command...)
 		out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 		return strings.TrimSpace(string(out)), err
+	}
+	runImage := func(t *testing.T, overrides map[string]string, command ...string) (string, error) {
+		t.Helper()
+		return runWithImage(t, image, overrides, command...)
 	}
 	runBackupImage := func(t *testing.T, overrides map[string]string, command ...string) {
 		t.Helper()
@@ -189,6 +194,41 @@ func TestDockerBackupRestore(t *testing.T) {
 		return string(data)
 	}
 
+	if previous := os.Getenv("PREVIOUS_BACKUP_IMAGE"); previous != "" {
+		t.Run("restore_previous_backup", func(t *testing.T) {
+			instance := name + "-previous"
+			t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", instance) })
+			docker(t, ctx, "run", "-d", "--name", instance, "--network", "container:"+mariadb,
+				"-e", "MARIADB_ROOT_PASSWORD=integration-password", "-e", "MARIADB_DATABASE=compat",
+				os.Getenv("PREVIOUS_MARIADB_IMAGE"), "--port=3308")
+			source := []string{"exec", instance, "mariadb", "--host=127.0.0.1", "--port=3308", "--user=root",
+				"--password=integration-password", "--batch", "--skip-column-names", "--execute"}
+			waitFor(t, ctx, "previous MariaDB", func(ctx context.Context) error {
+				return exec.CommandContext(ctx, "docker", append(source, "SELECT 1")...).Run()
+			})
+			docker(t, ctx, append(source, `CREATE TABLE compat.records (id INT PRIMARY KEY, payload VARBINARY(16));
+				INSERT INTO compat.records VALUES (1, X'00FF'), (2, X'ABCDEF');
+				CREATE PROCEDURE compat.read_record(IN n INT) SELECT HEX(payload) FROM compat.records WHERE id=n;`)...)
+			const rows = "SELECT id, HEX(payload) FROM compat.records ORDER BY id"
+			const routine = "CALL compat.read_record(2)"
+			wantRows := strings.TrimSpace(docker(t, ctx, append(source, rows)...))
+			wantRoutine := strings.TrimSpace(docker(t, ctx, append(source, routine)...))
+
+			env := map[string]string{"S3_PREFIX": "previous", "MARIADB_DATABASE": "compat", "MARIADB_PORT": "3308"}
+			if out, err := runWithImage(t, previous, env, "mariadb-backup-s3", "backup"); err != nil {
+				t.Fatalf("previous image backup failed: %v\n%s", err, out)
+			}
+			delete(env, "MARIADB_PORT") // Restore into the separate, current server.
+			runBackupImage(t, env, "mariadb-backup-s3", "restore")
+			if got := sql(t, rows); got != wantRows {
+				t.Fatalf("restored rows = %q, previous server had %q", got, wantRows)
+			}
+			if got := sql(t, routine); got != wantRoutine {
+				t.Fatalf("restored procedure returned %q, previous server returned %q", got, wantRoutine)
+			}
+			sql(t, "DROP DATABASE compat")
+		})
+	}
 	if !t.Run("timestamp_plaintext", func(t *testing.T) {
 		env := map[string]string{"S3_PREFIX": "timestamp"}
 		// Exercise the default CMD as well as the restore wrapper.
@@ -411,7 +451,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		sql(t, "GRANT TRIGGER ON Sys.Orders TO PUBLIC")
 		for _, opt := range []string{"--ignore-table=", "--ignore-table-data="} {
 			env["MARIADB_DUMP_EXTRA_OPTS"] = opt + "Sys.orders"
-			checkFailure("ambiguous exclusion")
+			checkFailure(`dump exclusion also matches "Sys.Orders"`)
 		}
 		delete(env, "MARIADB_DUMP_EXTRA_OPTS")
 		runBackupImage(t, env, "mariadb-backup-s3", "backup")
@@ -428,7 +468,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", instance) })
 		docker(t, ctx, "run", "-d", "--name", instance, "--network", "container:"+mariadb,
 			"-e", "MARIADB_ROOT_PASSWORD=integration-password", "-e", "MARIADB_DATABASE=SalesData",
-			envOr("MARIADB_TEST_IMAGE", "mariadb:11.4"), "--port=3307", "--lower-case-table-names=1")
+			envOr("MARIADB_TEST_IMAGE", defaultMariaDBTestImage), "--port=3307", "--lower-case-table-names=1")
 		waitFor(t, ctx, "case-insensitive MariaDB", func(ctx context.Context) error {
 			return exec.CommandContext(ctx, "docker", "exec", instance, "mariadb", "--protocol=tcp", "-h127.0.0.1", "-P3307", "-uroot", "-pintegration-password", "-e", "SELECT 1").Run()
 		})
@@ -459,7 +499,13 @@ func TestDockerBackupRestore(t *testing.T) {
 		if dump := readDump(t, key); !strings.Contains(dump, "exposed") || strings.Contains(dump, "hidden") {
 			t.Fatal("restricted dump differs from account visibility")
 		}
-		sql(t, "GRANT SELECT, TRIGGER, SHOW VIEW, SHOW CREATE ROUTINE ON visibility.* TO 'visibility_test'@'%'; GRANT SELECT ON `visib%`.* TO 'visibility_test'@'%'")
+		sql(t, "GRANT SELECT, TRIGGER, SHOW VIEW ON visibility.* TO 'visibility_test'@'%'; GRANT SELECT ON `visib%`.* TO 'visibility_test'@'%'")
+		// MariaDB 10.11 predates the schema-level SHOW CREATE ROUTINE privilege.
+		if strings.HasPrefix(sql(t, "SELECT VERSION()"), "10.11.") {
+			sql(t, "GRANT SELECT ON mysql.proc TO 'visibility_test'@'%'")
+		} else {
+			sql(t, "GRANT SHOW CREATE ROUTINE ON visibility.* TO 'visibility_test'@'%'")
+		}
 		out, err = runImage(t, env, "mariadb-backup-s3", "backup")
 		if err != nil || strings.Contains(out, "cannot verify") {
 			t.Fatalf("complete access: %v %s", err, out)
