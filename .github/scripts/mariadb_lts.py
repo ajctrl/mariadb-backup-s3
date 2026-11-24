@@ -99,6 +99,7 @@ def add_series(root, series, version, digest):
         "matchPackageNames": ["mariadb"],
         "matchCurrentVersion": "/^" + series.replace(".", "[.]") + "[.]/",
         "groupName": f"MariaDB {series}",
+        "allowedVersions": "/^" + series.replace(".", "[.]") + "[.][0-9]+$/",
     })
     readme = root / "README.md"
     tags = ", ".join(f"`{s}`" for s in supported(source))

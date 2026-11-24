@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 import shutil
@@ -9,6 +10,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / ".github/scripts"))
 import mariadb_lts as lts
+import lts_proposal as proposal
 
 
 def release(series, status="Stable", support="Long Term Support", eol="2099-01-01"):
@@ -22,6 +24,16 @@ def tag(version, archs=("amd64", "arm64")):
 
 
 class LtsDiscovery(unittest.TestCase):
+    def test_patch_candidates_stay_in_each_supported_series(self):
+        config = json.loads((ROOT / "renovate.json").read_text())
+        for series in lts.supported((ROOT / "Dockerfile").read_text()):
+            rule, = (r for r in config["packageRules"] if r.get("groupName") == f"MariaDB {series}")
+            pattern = rule["allowedVersions"].strip("/")
+            self.assertRegex(series + ".14", pattern)
+            major, minor = map(int, series.split("."))
+            self.assertNotRegex(f"{major}.{minor + 1}.1", pattern)
+            self.assertNotRegex(series + ".14-rc", pattern)
+
     def test_discover_add_and_repeat(self):
         existing = lts.supported((ROOT / "Dockerfile").read_text())
         # Pick an unregistered series even after real series have been added.
@@ -53,6 +65,8 @@ class LtsDiscovery(unittest.TestCase):
             rule = json.loads(contents[2])["packageRules"][-1]
             self.assertEqual(rule["groupName"], "MariaDB " + series)
             self.assertRegex(entry["name"], rule["matchCurrentVersion"].strip("/"))
+            self.assertRegex(entry["name"], rule["allowedVersions"].strip("/"))
+            self.assertNotRegex(new + ".4.1", rule["allowedVersions"].strip("/"))
             lts.add_series(root, **candidates[0])
             self.assertEqual(contents, [p.read_text() for p in files])
             with patch.object(lts, "fetch", return_value=catalog) as fetch:
@@ -66,6 +80,42 @@ class LtsDiscovery(unittest.TestCase):
                 catalog, {"results": tags, "next": None},
             ]):
                 self.assertEqual(lts.discover([]), [])
+
+
+class LtsProposal(unittest.TestCase):
+    repo = "example/backup"
+    bot = "lts-app[bot]"
+    old = "sha256:" + "a" * 64
+    new = "sha256:" + "b" * 64
+
+    def test_open_proposal_refreshes_only_its_pin_at_the_read_head(self):
+        pull = {"state": "open", "user": {"login": self.bot},
+                "head": {"repo": {"full_name": self.repo}, "sha": "1" * 40}}
+        source = f"# maintainer edit\nFROM mariadb:99.3.2@{self.old} AS client-99.3\n"
+        for author, version, digest, write in [
+            (self.bot, "99.3.3", self.new, True), (self.bot, "99.3.2", self.new, True),
+            (self.bot, "99.3.2", self.old, False), ("maintainer", "99.3.3", self.new, False),
+            (self.bot, "99.3.1", self.new, False),
+        ]:
+            ranges = [{"startingLine": 2, "endingLine": 2, "commit": {"author": {"user": {"login": author}}}}]
+            data = {"file": {"text": source}, "head": {"blame": {"ranges": ranges}}}
+            with self.subTest(author=author, version=version, digest=digest), patch.object(
+                proposal, "api", side_effect=[[pull], {"data": {"repository": data}}, {}]
+            ) as api:
+                self.assertFalse(proposal.prepare(self.repo, "lts/mariadb-99.3", "99.3", version, digest, self.bot))
+                self.assertEqual(api.call_count, 3 if write else 2)
+                if write:
+                    commit = api.call_args.kwargs["payload"]["variables"]["input"]
+                    self.assertEqual(commit["expectedHeadOid"], pull["head"]["sha"])
+                    change, = commit["fileChanges"]["additions"]
+                    self.assertEqual(change["path"], "Dockerfile")
+                    expected = source.replace("99.3.2@" + self.old, version + "@" + digest)
+                    self.assertEqual(base64.b64decode(change["contents"]).decode(), expected)
+
+    def test_closed_proposal_stays_closed(self):
+        with patch.object(proposal, "api", return_value=[{"state": "closed"}]) as api:
+            self.assertFalse(proposal.prepare(self.repo, "lts/mariadb-99.3", "99.3", "99.3.2", self.new, self.bot))
+            api.assert_called_once()
 
 
 if __name__ == "__main__":

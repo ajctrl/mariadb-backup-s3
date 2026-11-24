@@ -129,7 +129,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		"S3_ACCESS_KEY_ID": "integration", "S3_SECRET_ACCESS_KEY": "integration-password",
 	}
 	runNumber := 0
-	runImage := func(t *testing.T, overrides map[string]string, command ...string) (string, error) {
+	runWithImage := func(t *testing.T, image string, overrides map[string]string, command ...string) (string, error) {
 		t.Helper()
 		runNumber++
 		container := fmt.Sprintf("%s-run-%d", name, runNumber)
@@ -154,6 +154,10 @@ func TestDockerBackupRestore(t *testing.T) {
 		args = append(args, command...)
 		out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 		return strings.TrimSpace(string(out)), err
+	}
+	runImage := func(t *testing.T, overrides map[string]string, command ...string) (string, error) {
+		t.Helper()
+		return runWithImage(t, image, overrides, command...)
 	}
 	runBackupImage := func(t *testing.T, overrides map[string]string, command ...string) {
 		t.Helper()
@@ -190,6 +194,41 @@ func TestDockerBackupRestore(t *testing.T) {
 		return string(data)
 	}
 
+	if previous := os.Getenv("PREVIOUS_BACKUP_IMAGE"); previous != "" {
+		t.Run("restore_previous_backup", func(t *testing.T) {
+			instance := name + "-previous"
+			t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", instance) })
+			docker(t, ctx, "run", "-d", "--name", instance, "--network", "container:"+mariadb,
+				"-e", "MARIADB_ROOT_PASSWORD=integration-password", "-e", "MARIADB_DATABASE=compat",
+				os.Getenv("PREVIOUS_MARIADB_IMAGE"), "--port=3308")
+			source := []string{"exec", instance, "mariadb", "--host=127.0.0.1", "--port=3308", "--user=root",
+				"--password=integration-password", "--batch", "--skip-column-names", "--execute"}
+			waitFor(t, ctx, "previous MariaDB", func(ctx context.Context) error {
+				return exec.CommandContext(ctx, "docker", append(source, "SELECT 1")...).Run()
+			})
+			docker(t, ctx, append(source, `CREATE TABLE compat.records (id INT PRIMARY KEY, payload VARBINARY(16));
+				INSERT INTO compat.records VALUES (1, X'00FF'), (2, X'ABCDEF');
+				CREATE PROCEDURE compat.read_record(IN n INT) SELECT HEX(payload) FROM compat.records WHERE id=n;`)...)
+			const rows = "SELECT id, HEX(payload) FROM compat.records ORDER BY id"
+			const routine = "CALL compat.read_record(2)"
+			wantRows := strings.TrimSpace(docker(t, ctx, append(source, rows)...))
+			wantRoutine := strings.TrimSpace(docker(t, ctx, append(source, routine)...))
+
+			env := map[string]string{"S3_PREFIX": "previous", "MARIADB_DATABASE": "compat", "MARIADB_PORT": "3308"}
+			if out, err := runWithImage(t, previous, env, "mariadb-backup-s3", "backup"); err != nil {
+				t.Fatalf("previous image backup failed: %v\n%s", err, out)
+			}
+			delete(env, "MARIADB_PORT") // Restore into the separate, current server.
+			runBackupImage(t, env, "mariadb-backup-s3", "restore")
+			if got := sql(t, rows); got != wantRows {
+				t.Fatalf("restored rows = %q, previous server had %q", got, wantRows)
+			}
+			if got := sql(t, routine); got != wantRoutine {
+				t.Fatalf("restored procedure returned %q, previous server returned %q", got, wantRoutine)
+			}
+			sql(t, "DROP DATABASE compat")
+		})
+	}
 	if !t.Run("timestamp_plaintext", func(t *testing.T) {
 		env := map[string]string{"S3_PREFIX": "timestamp"}
 		// Exercise the default CMD as well as the restore wrapper.

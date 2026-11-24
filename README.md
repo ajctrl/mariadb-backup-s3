@@ -32,6 +32,10 @@ for new stable Community LTS series. Once a numeric patch tag is available for
 both Linux architectures in the official MariaDB image, the GitHub App opens
 one PR for that series. Review its backup and restore results and merge the
 first PR manually. Later patch and digest PRs follow the usual Renovate policy.
+While the PR is open, a new patch or digest updates the bot-authored image pin
+and triggers CI again. Maintainer edits to the pin take precedence.
+For an existing series whose image recipe changes, CI also restores a backup
+created by the base commit's image and checks the rows and stored procedure.
 Closing a series proposal leaves it closed on future checks. Reopen it to resume.
 
 Use the same client family to dump and restore,

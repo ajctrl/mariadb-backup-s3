@@ -82,7 +82,8 @@
         "mariadb"
       ],
       "matchCurrentVersion": "/^10[.]11[.]/",
-      "groupName": "MariaDB 10.11"
+      "groupName": "MariaDB 10.11",
+      "allowedVersions": "/^10[.]11[.][0-9]+$/"
     },
     {
       "matchDatasources": [
@@ -92,7 +93,8 @@
         "mariadb"
       ],
       "matchCurrentVersion": "/^11[.]4[.]/",
-      "groupName": "MariaDB 11.4"
+      "groupName": "MariaDB 11.4",
+      "allowedVersions": "/^11[.]4[.][0-9]+$/"
     },
     {
       "matchDatasources": [
@@ -102,7 +104,8 @@
         "mariadb"
       ],
       "matchCurrentVersion": "/^11[.]8[.]/",
-      "groupName": "MariaDB 11.8"
+      "groupName": "MariaDB 11.8",
+      "allowedVersions": "/^11[.]8[.][0-9]+$/"
     },
     {
       "matchDatasources": [
@@ -112,7 +115,8 @@
         "mariadb"
       ],
       "matchCurrentVersion": "/^12[.]3[.]/",
-      "groupName": "MariaDB 12.3"
+      "groupName": "MariaDB 12.3",
+      "allowedVersions": "/^12[.]3[.][0-9]+$/"
     }
   ],
   "customManagers": [
