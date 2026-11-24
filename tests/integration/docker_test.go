@@ -34,7 +34,11 @@ func TestDockerBackupRestore(t *testing.T) {
 	}
 	docker(t, ctx, "info", "--format", "{{.ServerVersion}}")
 	image := envOr("BACKUP_TEST_IMAGE", "mariadb-backup-s3:integration")
-	docker(t, ctx, "image", "inspect", image)
+	for flag, want := range map[string]string{"-u": "10001", "-g": "10001"} {
+		if got := strings.TrimSpace(docker(t, ctx, "run", "--rm", "--pull=never", image, "id", flag)); got != want {
+			t.Fatalf("backup image id %s = %s, want %s", flag, got, want)
+		}
+	}
 
 	name := fmt.Sprintf("mariadbs3-integration-%d", time.Now().UnixNano())
 	docker(t, ctx, "network", "create", name)

@@ -21,6 +21,10 @@ that server on both `linux/amd64` and `linux/arm64`. A plain local build and
 the Compose example use `11.4`. To build another series, pass e.g.
 `--build-arg MARIADB_SERIES=12.3` to `docker build`.
 
+The backup container runs as UID and GID 10001. Mount AWS profiles under
+`/home/mariadb-backup/.aws` and grant this user read access to mounted credentials
+and CA certificates. If you mount a directory for `TMPDIR`, grant it write access there.
+
 After a tested commit lands on `main`, CI publishes each series to GHCR
 under `<series>-sha-<commit>` and promotes its series tag while that commit
 is still the head of `main`. For example, pull
@@ -65,8 +69,11 @@ docker run --rm --env-file .env mariadb-backup-s3:11.4 mariadb-backup-s3 backup
 ```
 
 `docker compose --env-file .env up -d --build` starts an isolated
-development database named `app` and the backup service. The Compose database
-uses development-only root credentials and requires your configured S3 bucket.
+development database named `app` and the backup service. The database server
+runs as the Linux user `mysql`. On first initialization MariaDB creates the
+`app_backup` account with privileges on `app.*` for backup and restore.
+Grant this account access to each additional database you want to back up.
+The Compose passwords are for local development. Configure your own S3 bucket.
 
 ## Database selection
 
@@ -292,6 +299,17 @@ partially restored database, and objects absent from the dump are not removed.
 
 Use the same `S3_PREFIX`, `BACKUP_MODE`, `BACKUP_FILENAME_MODE`, and `PASSPHRASE`
 as the backup. Set database connection variables to the destination server.
+
+On MariaDB 11.4, restoring a view, trigger, event, or routine with another
+account's `DEFINER` requires the global `SET USER` privilege in addition to
+the privileges to recreate the object. Use a dedicated restore account for this.
+With the password for `app_restore` exported as `MARIADB_PASSWORD` in the
+calling shell, the following command uses that account for one Compose restore.
+
+```sh
+docker compose run --rm -e MARIADB_USER=app_restore -e MARIADB_PASSWORD \
+  backup mariadb-backup-s3 restore
+```
 
 In per-database mode, set `MARIADB_DATABASE` to the database to restore. New
 backups include the source database's native `CREATE DATABASE` metadata.
