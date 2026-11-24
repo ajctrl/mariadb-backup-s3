@@ -54,4 +54,6 @@ ENV BACKUP_ALLOW_UNVERSIONED_OVERWRITE='false'
 COPY --chmod=755 src/run.sh src/backup.sh src/restore.sh /
 COPY LICENSE LICENSE.txt /usr/share/licenses/mariadb-backup-s3/
 
+ENV HOME=/home/mariadb-backup
+USER 10001:10001
 CMD ["mariadb-backup-s3", "run"]

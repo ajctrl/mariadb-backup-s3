@@ -4,9 +4,13 @@
 services:
   mariadb:
     image: mariadb:11.4.13@sha256:a8992b5e5404d11e03c54a31d0c1bdea3fd116d283aa6d1a627551f29045309b
+    user: mysql
     environment:
       MARIADB_ROOT_PASSWORD: development-password
+      MARIADB_ROOT_HOST: localhost
       MARIADB_DATABASE: app
+      MARIADB_USER: app_backup
+      MARIADB_PASSWORD: development-backup-password
     healthcheck:
       test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
       interval: 5s
@@ -45,5 +49,5 @@ services:
       MARIADB_BACKUP_ALL: ${MARIADB_BACKUP_ALL:-false}
       MARIADB_DATABASES_EXCLUDE: ${MARIADB_DATABASES_EXCLUDE:-}
       MARIADB_DUMP_EXTRA_OPTS: ${MARIADB_DUMP_EXTRA_OPTS:-}
-      MARIADB_USER: root
-      MARIADB_PASSWORD: development-password
+      MARIADB_USER: app_backup
+      MARIADB_PASSWORD: development-backup-password
