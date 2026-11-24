@@ -460,7 +460,13 @@ func TestDockerBackupRestore(t *testing.T) {
 		if dump := readDump(t, key); !strings.Contains(dump, "exposed") || strings.Contains(dump, "hidden") {
 			t.Fatal("restricted dump differs from account visibility")
 		}
-		sql(t, "GRANT SELECT, TRIGGER, SHOW VIEW, SHOW CREATE ROUTINE ON visibility.* TO 'visibility_test'@'%'; GRANT SELECT ON `visib%`.* TO 'visibility_test'@'%'")
+		sql(t, "GRANT SELECT, TRIGGER, SHOW VIEW ON visibility.* TO 'visibility_test'@'%'; GRANT SELECT ON `visib%`.* TO 'visibility_test'@'%'")
+		// MariaDB 10.11 predates the schema-level SHOW CREATE ROUTINE privilege.
+		if strings.HasPrefix(sql(t, "SELECT VERSION()"), "10.11.") {
+			sql(t, "GRANT SELECT ON mysql.proc TO 'visibility_test'@'%'")
+		} else {
+			sql(t, "GRANT SHOW CREATE ROUTINE ON visibility.* TO 'visibility_test'@'%'")
+		}
 		out, err = runImage(t, env, "mariadb-backup-s3", "backup")
 		if err != nil || strings.Contains(out, "cannot verify") {
 			t.Fatalf("complete access: %v %s", err, out)
