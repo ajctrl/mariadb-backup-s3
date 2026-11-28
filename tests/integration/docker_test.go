@@ -21,7 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-const defaultMariaDBTestImage = "mariadb:11.4.13@sha256:a8992b5e5404d11e03c54a31d0c1bdea3fd116d283aa6d1a627551f29045309b"
+const defaultMariaDBTestImage = "mariadb:11.4.14@sha256:3142de550b6cd60c30636e2b260eb2f923fe10a5675e88dc86a8ea09eacda8c5"
 const defaultS3TestImage = "docker.io/jcometki/minio:RELEASE.2025-09-07T16-13-09Z-multiarch@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
 
 // TestDockerBackupRestore requires a local Docker daemon and an already-built

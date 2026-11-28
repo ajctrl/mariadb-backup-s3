@@ -3,7 +3,7 @@
 
 services:
   mariadb:
-    image: mariadb:11.4.13@sha256:a8992b5e5404d11e03c54a31d0c1bdea3fd116d283aa6d1a627551f29045309b
+    image: mariadb:11.4.14@sha256:3142de550b6cd60c30636e2b260eb2f923fe10a5675e88dc86a8ea09eacda8c5
     user: mysql
     environment:
       MARIADB_ROOT_PASSWORD: development-password
