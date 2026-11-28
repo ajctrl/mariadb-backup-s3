@@ -14,7 +14,7 @@ COPY internal/ internal/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/mariadb-backup-s3 ./cmd/mariadb-backup-s3
 
-FROM mariadb:10.11.19@sha256:e5fe75b2b9de0eb9f6f9a4d9c97272fb3a7480e389ccd487a786bab2a12cc0d7 AS client-10.11
+FROM mariadb:10.11.20@sha256:aed943ea1f5904cc600bc1459fb25fe09b1a4cf76b6c1ef9a65af57a8b9f1738 AS client-10.11
 FROM mariadb:11.4.13@sha256:a8992b5e5404d11e03c54a31d0c1bdea3fd116d283aa6d1a627551f29045309b AS client-11.4
 FROM mariadb:11.8.9@sha256:e1d5495f445654134f226f55a41ce0da227116f6f27f283101f405c794d841fc AS client-11.8
 FROM mariadb:12.3.3@sha256:4aaf88b3106382c8c18e49f0cec60267be618fc22f858c4503afb2a2555afed3 AS client-12.3
